@@ -55,6 +55,18 @@ The installer:
 
 No admin rights required. Works on macOS, Ubuntu, Windows, WSL2, and Termux.
 
+### Run from source (without global install)
+
+```sh
+git clone https://github.com/tayyabimam1/Agent8088-Features-added.git
+cd Agent8088-Features-added
+uv sync
+uv run agent8088 --setup    # configure your model provider
+uv run agent8088            # start the REPL
+```
+
+In this mode, prefix every `agent8088` command in this README with `uv run`.
+
 ### Verify
 
 ```sh
@@ -265,6 +277,7 @@ python3 research/skillopt.py --restore      # Restore pre-optimization skill
 git clone https://github.com/tayyabimam1/Agent8088-Features-added.git
 cd Agent8088-Features-added
 uv sync
+uv run agent8088 --setup    # configure model provider (or skip and edit config.txt)
 ```
 
 ### Run Tests
