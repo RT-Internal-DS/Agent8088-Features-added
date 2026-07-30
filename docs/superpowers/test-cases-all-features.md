@@ -1,7 +1,7 @@
 # Agent8088 — Comprehensive Test Case Prompts
 
 > Manual end-to-end test prompts covering every feature.  
-> Run these in the Rich UI (`python agent8088_cli.py`) or as one-shot queries (`python agent8088 "..."`).
+> Run these in the Rich UI (`agent8088`).
 
 ---
 
@@ -75,8 +75,8 @@
 | 4.6 | After 4.1 completes, immediately ask `delete /tmp/hello_again.txt too` | Type `y` again | Prompts y/n **again** — one-shot grant reverted after 4.1 | Revert to readonly |
 | 4.7 | `read tools.txt` | — | `read_text` always allowed in readonly | Read-only allowed modes |
 | 4.8 | `calculate 2^10` | — | `calculate` always allowed in readonly | Read-only allowed modes |
-| 4.9 | Run `python agent8088_cli.py --edit` then `delete /tmp/hello.txt` | — | No escalation — edit mode from start | `--edit` flag |
-| 4.10 | Run `AGENT8088_PERMISSION=edit python agent8088 "delete /tmp/hello.txt"` | — | Old REPL one-shot, no prompt | Env var override |
+| 4.9 | Run `agent8088 --edit` then `delete /tmp/hello.txt` | — | No escalation — edit mode from start | `--edit` flag |
+| 4.10 | Run `AGENT8088_PERMISSION=edit agent8088`, then enter `delete /tmp/hello.txt` | — | No permission prompt | Env var override |
 
 ---
 
@@ -144,7 +144,7 @@
 
 ## 10. Rich UI Slash Commands
 
-Run these inside `python agent8088_cli.py`:
+Run these inside `agent8088`:
 
 | # | Slash Command | Expected | Feature |
 |---|---|---|---|
@@ -174,10 +174,10 @@ Run these inside `python agent8088_cli.py`:
 
 | # | Steps | Expected | Feature |
 |---|---|---|---|
-| 11.1 | Start `python agent8088_cli.py` (readonly). Ask `create a folder ./test_perm`. | Escalation panel (yellow, rounded). Type `y`. Model receives "Permission granted. Retry the tool call that was blocked." Retries `mkdir` → succeeds. | Full escalation cycle |
+| 11.1 | Start `agent8088` (readonly). Ask `create a folder ./test_perm`. | Escalation panel (yellow, rounded). Type `y`. Model receives "Permission granted. Retry the tool call that was blocked." Retries `mkdir` → succeeds. | Full escalation cycle |
 | 11.2 | Same as 11.1 but type **`n`** | "Permission denied — staying in readonly mode." Model tells you the task can't be completed. Does not retry. | Denial path |
-| 11.3 | Start `python agent8088_cli.py --edit`. Ask `create a folder ./test_perm2`. | No escalation — edit mode from start. | `--edit` flag |
-| 11.4 | `AGENT8088_PERMISSION=edit python agent8088 "list files"` | Old REPL one-shot, edit mode, no prompts | Env var + backward compat |
+| 11.3 | Start `agent8088 --edit`. Ask `create a folder ./test_perm2`. | No escalation — edit mode from start. | `--edit` flag |
+| 11.4 | Start `AGENT8088_PERMISSION=edit agent8088`, then enter `list files` | Edit mode, no prompts | Env var override |
 
 ---
 
@@ -185,7 +185,7 @@ Run these inside `python agent8088_cli.py`:
 
 | # | Command | Expected | Feature |
 |---|---|---|---|
-| 12.1 | `python agent8088 "what is 2+2"` | Old REPL, answers 4, edit mode by default, no escalation | Old REPL defaults to edit |
+| 12.1 | Start `agent8088`, then enter `what is 2+2` | Answers 4 | Interactive execution |
 | 12.2 | `python research/run_benchmark.py` | Runs benchmarks without escalation prompts (sets `AGENT8088_PERMISSION=edit` internally) | Benchmark backward compat |
 
 ---
