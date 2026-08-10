@@ -31,6 +31,10 @@ DEDUP_MAX = 500
 
 
 def markdown_to_discord(text: str) -> str:
+    # Strip platform-native mentions — a model output containing a valid Discord
+    # user ID would render as a mention, pinging arbitrary users.
+    text = re.sub(r"<@!?\d+>", "", text)
+    text = re.sub(r"<#\d+>", "", text)
     fences = []
     def _stash_fence(m):
         fences.append(m.group(0))

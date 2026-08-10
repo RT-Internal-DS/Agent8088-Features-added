@@ -54,10 +54,12 @@ def test_escalation_request_returns_structured_message():
     assert "test.txt" in result
 
 def test_escalation_grants_one_blocked_action():
+    key = A._tool_call_key("write_file", {"filename": "x.txt"})
+    A._remember_escalation("write_file", {"filename": "x.txt"}, "ESCALATION_REQUEST:edit:new_file:x.txt:blocked")
     A.grant_escalation()
     assert A.PERMISSION_MODE == "readonly"
-    assert A.check_permission("write_text") is True
-    assert A.check_permission("write_text") is False
+    assert A.check_permission("write_text", approval_key=key) is True
+    assert A.check_permission("write_text", approval_key=key) is False
 
 
 def test_escalation_grant_is_bound_to_the_blocked_call():
@@ -73,15 +75,18 @@ def test_escalation_grant_is_bound_to_the_blocked_call():
 
 
 def test_new_turn_drops_an_unspent_escalation_grant():
+    A._remember_escalation("write_file", {"filename": "x.txt"}, "ESCALATION_REQUEST:edit:new_file:x.txt:blocked")
     A.grant_escalation()
     A.reset_turn_approval_state()
     assert A.check_permission("write_text") is False
 
 def test_safe_action_does_not_consume_one_shot_grant():
+    key = A._tool_call_key("write_file", {"filename": "x.txt"})
+    A._remember_escalation("write_file", {"filename": "x.txt"}, "ESCALATION_REQUEST:edit:new_file:x.txt:blocked")
     A.grant_escalation()
     assert A.check_permission("read_text") is True
-    assert A.check_permission("write_text") is True
-    assert A.check_permission("write_text") is False
+    assert A.check_permission("write_text", approval_key=key) is True
+    assert A.check_permission("write_text", approval_key=key) is False
 
 def test_run_tool_blocks_write_in_readonly(tmp_path, monkeypatch):
     A.PERMISSION_MODE = "readonly"
@@ -252,6 +257,7 @@ def test_hard_git_blocks_survive_edit_and_one_shot_grants():
         "bash -lc 'git reset --hard HEAD'",
         "sh -c \"sh -c 'git branch -D main'\"",
     ):
+        A._remember_escalation("execute_shell", {"command": command}, f"ESCALATION_REQUEST:edit:local_execution:{command}:blocked")
         A.grant_escalation()
         assert A.check_permission("shell", command) is False
         assert "forbidden" in A.run_tool("execute_shell", {"command": command}).lower()
@@ -317,6 +323,81 @@ def test_plan_reports_missing_arguments_instead_of_crashing():
     assert "requires arguments" in result
     assert "filename" in result
 
+
+def test_plan_execution_grant_cleared_when_on_step_raises(tmp_path, monkeypatch):
+    """on_step raising mid-plan must not leak _plan_execution_grant across turns.
+
+    The grant is set True at plan approval and cleared at loop end. If a
+    progress callback (on_step) raises before the clear runs, the grant
+    persists and plan-only mode is silently bypassed for the rest of the
+    process. The clear must run in a finally block.
+    """
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(A, "PROMPT_PATHS", [tmp_path])
+    monkeypatch.setattr(A, "PERMISSION_MODE", "plan-only")
+    A._plan_execution_grant = False
+
+    target = tmp_path / "x.txt"
+    steps = [
+        {"step": "write file 1", "tool": "write_file",
+         "arguments": {"filename": str(target), "content": "a"}},
+        {"step": "write file 2", "tool": "write_file",
+         "arguments": {"filename": str(target), "content": "b"}},
+    ]
+
+    call_count = {"n": 0}
+    def boom_on_step(idx, total, step_text, tool_name, status, result):
+        call_count["n"] += 1
+        if call_count["n"] == 2:  # second on_step("running", ...) raises
+            raise RuntimeError("gateway blew up")
+
+    try:
+        A._exec_plan({"steps": steps}, on_step=boom_on_step, on_escalation=lambda req: True)
+    except RuntimeError:
+        pass
+
+    assert A._plan_execution_grant is False, \
+        "grant leaked across turns after on_step raised — plan-only bypassed"
+
+
+def test_plan_execution_grant_cleared_when_on_escalation_raises(tmp_path, monkeypatch):
+    """on_escalation raising during re-approval must not leak the grant.
+
+    The re-approval callback at the ESCALATION_REQUEST retry path runs after
+    the grant is set True. If it raises, the loop aborts past the clear and
+    the grant persists. The clear must run in a finally block.
+    """
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(A, "PROMPT_PATHS", [tmp_path])
+    monkeypatch.setattr(A, "PERMISSION_MODE", "plan-only")
+    A._plan_execution_grant = False
+
+    target = tmp_path / "y.txt"
+    steps = [{"step": "write", "tool": "write_file",
+              "arguments": {"filename": str(target), "content": "z"}}]
+
+    def boom_on_escalation(request):
+        raise RuntimeError("escalation channel died")
+
+    try:
+        A._exec_plan({"steps": steps}, on_step=lambda *a: None, on_escalation=boom_on_escalation)
+    except RuntimeError:
+        pass
+
+    assert A._plan_execution_grant is False
+
+
+def test_reset_turn_approval_state_clears_plan_execution_grant():
+    """Defense-in-depth: reset_turn_approval_state must clear the plan grant.
+
+    If some other path leaks the grant, the next turn boundary must wipe it
+    so plan-only mode can't be bypassed for the rest of the process.
+    """
+    A._plan_execution_grant = True
+    A.reset_turn_approval_state()
+    assert A._plan_execution_grant is False
+
+
 def test_escalation_tool_is_not_model_callable():
     assert "request_permission_escalation" not in A.TOOL_NAMES
 
@@ -349,9 +430,11 @@ def test_escalation_message_format():
     assert "Write test.txt" in parts[4]
 
 def test_grant_escalation_does_not_persist():
+    key = A._tool_call_key("execute_shell", {"command": "rm file"})
+    A._remember_escalation("execute_shell", {"command": "rm file"}, "ESCALATION_REQUEST:edit:local_execution:rm file:blocked")
     A.grant_escalation()
-    assert A.check_permission("shell", "rm file") is True
-    assert A.check_permission("shell", "rm file") is False
+    assert A.check_permission("shell", "rm file", approval_key=key) is True
+    assert A.check_permission("shell", "rm file", approval_key=key) is False
 
 def test_env_var_sets_edit_mode():
     import importlib
@@ -392,6 +475,7 @@ def test_shell_startup_file_writes_blocked_after_one_shot_grant(tmp_path, monkey
     A.PERMISSION_MODE = "readonly"
     monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
     monkeypatch.setattr(A, "NO_PROMPT_PATHS", [tmp_path])
+    A._remember_escalation("write_file", {"filename": str(tmp_path / ".zshrc"), "content": "x"}, "ESCALATION_REQUEST:edit:new_file:.zshrc:blocked")
     A.grant_escalation()
 
     result = A.run_tool("write_file", {"filename": str(tmp_path / ".zshrc"), "content": "x"})

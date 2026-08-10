@@ -44,6 +44,9 @@ skillopt_data/
 graphify-out/
 .opencode/
 
+# Agent instruction files (local agent config, not project source)
+AGENTS.md
+
 # Config snapshots (may contain secrets - never commit)
 backup.txt
 opencode.json

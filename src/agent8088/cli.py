@@ -1261,7 +1261,8 @@ def cmd_raw(rest):
     tcs = getattr(m, "tool_calls", None) or []
     console.print(Panel(Text(content or "(empty)"), title="content", box=box.MINIMAL, border_style="#00C8FF"))
     if reasoning:
-        console.print(Panel(Text(reasoning), title="reasoning_content", box=box.MINIMAL, border_style="#0077B6"))
+        masked = A._mask_system_content(reasoning)
+        console.print(Panel(Text(masked), title="reasoning_content", box=box.MINIMAL, border_style="#0077B6"))
     if tcs:
         rows = "\n".join(f"{tc.function.name}({tc.function.arguments})" for tc in tcs)
         console.print(Panel(Text(rows), title="tool_calls", box=box.MINIMAL, border_style="#0077B6"))
@@ -2215,10 +2216,34 @@ def _agent8088_link_dir():
 
 
 def _safe_uninstall_home(path):
+    """Refuse to rmtree unless target is the default agent8088 home or a descendant of it.
+
+    The old guard only excluded {root, home}, so a misconfigured AGENT8088_HOME
+    like /usr/local or C:\\Program Files\\SomeApp passed and was deleted. Now we
+    require the target to be inside the default home (~/.agent8088 or
+    LOCALAPPDATA/agent8088) OR contain an agent8088 marker file.
+    """
     target = path.expanduser().resolve(strict=False)
     home = Path.home().resolve(strict=False)
     root = Path(target.anchor).resolve(strict=False)
-    return target not in {root, home}
+    if target in {root, home}:
+        return False
+    # Default agent8088 home: ~/.agent8088 or %LOCALAPPDATA%/agent8088
+    defaults = [Path.home() / ".agent8088"]
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        defaults.append(Path(local_appdata) / "agent8088")
+    for d in defaults:
+        d_resolved = d.resolve(strict=False)
+        if target == d_resolved or d_resolved in target.parents:
+            return True
+    # Marker file: a directory that looks like an agent8088 install
+    # (contains config.txt or .env, the two files the engine always writes).
+    if target.is_dir():
+        for marker in ("config.txt", ".env"):
+            if (target / marker).exists():
+                return True
+    return False
 
 
 def _remove_agent8088_shim(home):

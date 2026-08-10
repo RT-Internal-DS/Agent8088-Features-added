@@ -212,16 +212,18 @@ class EmailAdapter(BaseChannelAdapter):
                 uid = uid_b.decode()
                 if uid in self._seen_uids:
                     continue
-                self._seen_uids.add(uid)
-                if len(self._seen_uids) > SEEN_UID_CAP:
-                    oldest = next(iter(self._seen_uids))
-                    self._seen_uids.discard(oldest)
                 status, msg_data = imap.uid("fetch", uid_b, "(RFC822)")
                 if status != "OK" or not msg_data or not msg_data[0]:
                     continue
                 raw_email = msg_data[0][1]
                 msg = email_lib.message_from_bytes(raw_email)
                 self._process_message(msg)
+                # Mark seen only AFTER successful processing — failures stay
+                # unseen so the next poll retries instead of silently dropping.
+                self._seen_uids.add(uid)
+                if len(self._seen_uids) > SEEN_UID_CAP:
+                    oldest = next(iter(self._seen_uids))
+                    self._seen_uids.discard(oldest)
         finally:
             try:
                 imap.logout()

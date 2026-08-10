@@ -209,8 +209,31 @@ def run_mcp_server(transport="stdio", host="127.0.0.1", port=8931):
         if host.lower() not in _LOOPBACK_HOSTS:
             raise ValueError("HTTP MCP must bind to localhost; remote MCP requires authentication, which is not configured.")
         server = create_mcp_server(host=host, port=port)
-        print(f"Agent8088 MCP server (HTTP) on http://{host}:{port}/mcp", file=sys.stderr)
-        server.run(transport="streamable-http")
+        app = server.streamable_http_app()
+        # Bearer-token auth + Origin check — blocks local-process and
+        # browser-originated requests from driving unattended writes.
+        import secrets as _secrets
+        _mcp_auth_token = A.APP_CONFIG.get("mcp_server_auth_token", "") or _secrets.token_hex(24)
+        if not A.APP_CONFIG.get("mcp_server_auth_token"):
+            print(f"MCP HTTP auth token (set mcp_server_auth_token in config to suppress this): {_mcp_auth_token}", file=sys.stderr)
+
+        from starlette.middleware.base import BaseHTTPMiddleware
+        class _MCPAuth(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                origin = request.headers.get("origin", "")
+                if origin:
+                    return _json403("cross-origin requests forbidden")
+                auth = request.headers.get("authorization", "")
+                if auth != f"Bearer {_mcp_auth_token}":
+                    return _json403("unauthorized")
+                return await call_next(request)
+        def _json403(msg):
+            from starlette.responses import JSONResponse
+            return JSONResponse({"error": msg}, status_code=403)
+        app.add_middleware(_MCPAuth)
+        print(f"Agent8088 MCP server (HTTP) on http://{host}:{port}/mcp (auth required)", file=sys.stderr)
+        import uvicorn
+        uvicorn.run(app, host=host, port=port)
     else:
         server = create_mcp_server()
         server.run(transport="stdio")

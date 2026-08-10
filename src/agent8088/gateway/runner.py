@@ -83,8 +83,11 @@ class GatewayRunner:
         self._turn_lock = asyncio.Lock()
         # Approval routing: (platform, chat_id) → _PendingApproval.
         self._pending_approvals: dict[tuple[str, str], _PendingApproval] = {}
-        # Session-scoped approvals are bound to the originating session and user.
-        self._session_allowlist: set[tuple[str, str, str]] = set()
+        self._session_allowlist: set[tuple[str, str, str, str]] = set()
+        # Per-chat outbox: messages that failed to send and get retried on the
+        # next successful turn from that chat. In-memory only — handles
+        # transient platform outages (Slack 5xx, Discord rate limit, bridge dead).
+        self._outbox: dict[str, list[str]] = {}
         self._rate_limiter = _RateLimiter(
             int(A.APP_CONFIG.get("gateway_rate_limit_per_min", "20")))
 
@@ -151,6 +154,17 @@ class GatewayRunner:
     async def _run_turn(self, key: str, event: MessageEvent) -> None:
         adapter = next((a for a in self.adapters if a.platform == event.platform), None)
 
+        # Retry any undelivered answers from a previous send failure before
+        # processing the new message — the platform may have recovered.
+        pending = self._outbox.pop(key, [])
+        for msg in pending:
+            try:
+                await adapter.send_message(event.chat_id, msg)
+            except Exception as e:
+                log.warning("outbox retry failed: %s", e)
+                self._outbox.setdefault(key, []).append(msg)
+                break
+
         async def _finalize(answer: str):
             clean = A.strip_tool_json(answer)
             if not clean.strip():
@@ -172,6 +186,7 @@ class GatewayRunner:
                 await adapter.send_message(event.chat_id, clean)
             except Exception as e:
                 log.warning("send_message failed: %s", e)
+                self._outbox.setdefault(key, []).append(clean)
 
         # on_escalation runs in the agent thread (sync). It sends the prompt
         # to chat via the async loop, then blocks on a threading.Event until
@@ -187,9 +202,11 @@ class GatewayRunner:
             _, target_mode, change_type, paths, reason = parts
             log.info("escalation: %s wants %s (chat=%s)", name, change_type, event.chat_id)
 
-            # Session-scoped auto-approve: if this change_type was already
-            # approved for the session, grant without prompting.
-            approval_scope = (key, event.user_id, change_type)
+            # Session-scoped auto-approve: if this (tool, change_type) was
+            # already approved for the session, grant without prompting.
+            # Scoped to tool_name so approving a write_file does NOT auto-approve
+            # an execute_shell — destructive shell via the same change_type stays gated.
+            approval_scope = (key, event.user_id, name, change_type)
             if approval_scope in self._session_allowlist:
                 log.info("escalation: auto-approved (session scope: %s)", change_type)
                 A.grant_escalation(change_type)

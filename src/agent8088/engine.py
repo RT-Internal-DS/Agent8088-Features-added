@@ -322,6 +322,12 @@ UNATTENDED = os.environ.get("AGENT8088_UNATTENDED", "").strip().lower() in (
 # /new, /compact) or invalidates the MCP tool cache (/mcp reload).
 DESTRUCTIVE_CONFIRM = APP_CONFIG.get("destructive_slash_confirm", "1") != "0"
 MCP_RELOAD_CONFIRM = APP_CONFIG.get("mcp_reload_confirm", "1") != "0"
+# Servers whose self-declared readOnlyHint is trusted to bypass the permission
+# gate. Comma-separated. Untrusted servers' readOnlyHint is advisory only —
+# their tools are still gated regardless of the hint.
+MCP_TRUSTED_SERVERS = {
+    s.strip() for s in APP_CONFIG.get("mcp_trusted_servers", "").split(",") if s.strip()
+}
 
 SANDBOX_BACKEND = os.environ.get(
     "AGENT8088_SANDBOX", APP_CONFIG.get("sandbox_backend", "auto")
@@ -398,9 +404,10 @@ def reset_approval_state() -> None:
 
 def reset_turn_approval_state() -> None:
     """Drop unspent grants before a new agent turn can use them."""
-    global _one_shot_grant, _local_fallback_grant, _remote_git_grant, _pending_approval_key
+    global _one_shot_grant, _local_fallback_grant, _remote_git_grant, _pending_approval_key, _plan_execution_grant
     _one_shot_grant = _local_fallback_grant = _remote_git_grant = False
     _pending_approval_key = ""
+    _plan_execution_grant = False
 
 
 def _tool_call_key(name: str, args: dict) -> str:
@@ -598,7 +605,23 @@ def _dangerous_git_args(tokens: list) -> bool:
             or any(not flag.startswith("-") for flag in flags)
         ))
         or (action == "stash" and any(flag in ("drop", "clear") for flag in flags))
+        or (action == "config" and _git_config_persists_arbitrary_exec(tokens[cursor + 1:]))
     )
+
+
+def _git_config_persists_arbitrary_exec(flags: list) -> bool:
+    """True if `git config` sets a key that executes arbitrary code on future git use.
+
+    core.editor, core.hooksPath, core.sshCommand, core.askpass all run external
+    commands at the user's next manual commit/push — a persistence vector.
+    """
+    dangerous = {"core.editor", "core.hookspath", "core.sshcommand", "core.askpass"}
+    for flag in flags:
+        if not flag.startswith("-"):
+            key = flag.split("=", 1)[0].lower()
+            if key in dangerous:
+                return True
+    return False
 
 
 # --- User-defined deny rules (config: deny_commands) ---
@@ -648,9 +671,15 @@ def _outside_user_allowlist(command: str) -> bool:
 # fork bombs, and remote-code-execution via pipe-to-shell at the root level.
 _UNRECOVERABLE_PATTERNS = [
     # rm -rf / — wipe filesystem root (any flag order, --no-preserve-root, long/short)
-    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?(?:[^|;&<>]*\s)?/(?:\s|$)"),
+    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?--?(?:[^-]*r|recursive)(?:[^|;&<>]*\s)?(?:[^|;&<>]*\s)?/(?:\s|$)"),
+    # rm -rf /* — shell glob expands to every entry under root
+    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?--?(?:[^-]*r|recursive)[^|;&<>]*?\s/\*(?:\s|$)"),
     # rm -rf ~ — wipe home dir
-    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?~(?:\s|$)"),
+    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?--?(?:[^-]*r|recursive)[^|;&<>]*?\s~(?:\s|$)"),
+    # rm -rf $HOME / $PWD — shlex doesn't expand env vars; classifier sees the literal name
+    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?--?(?:[^-]*r|recursive)[^|;&<>]*?\s\$(?:HOME|PWD)(?:\s|$)"),
+    # rm -rf . / ./ — wipe the current directory
+    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?--?(?:[^-]*r|recursive)[^|;&<>]*?\s\.(?:/|$|\s)"),
     re.compile(r"\bmkfs(?:\.\w+)?\s+/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
     re.compile(r"\bdd\s+if=\S+\s+of=/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
     re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;"),
@@ -932,7 +961,11 @@ def grant_escalation(change_type: str = ""):
         _local_fallback_grant = False
         _pending_approval_key = ""
         return
-    _one_shot_grant = _pending_approval_key or True
+    # Refuse to grant without a pending approval key — a blanket True would
+    # match ANY next tool call regardless of what the user intended to approve.
+    if not _pending_approval_key:
+        return
+    _one_shot_grant = _pending_approval_key
     _pending_approval_key = ""
     _local_fallback_grant = change_type == "local_execution"
     _remote_git_grant = False
@@ -1014,6 +1047,12 @@ def _provider_api_key(provider: dict) -> str:
       3. os.environ — ambient, so it is the LAST resort: a stray shell export
          (e.g. OPENAI_API_KEY set for another tool) must not silently redirect
          an explicitly configured provider
+
+    NOTE: This precedence (.env → config → os.environ) DISAGREES with
+    get_secret() at line 155 (.env → os.environ → config). The test
+    test_configured_api_key_wins_over_adapter_environment_key is
+    xfail(strict=False) for this reason. This is an open product decision
+    (AGENTS.md rule 3) — do not change one without aligning the other.
     """
     env_name = provider.get("api_key_env", "").strip()
     if env_name:
@@ -2027,46 +2066,48 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
                 return "Plan denied — staying in plan-only mode."
             _plan_execution_grant = True
 
-    outputs = []
-    for idx, step in enumerate(steps, 1):
-        if isinstance(step, dict):
-            step_text = str(step.get("step") or step.get("text") or "")
-            tool_name = str(step.get("tool") or classify_plan_component(step_text))
-            given = step.get("arguments") if isinstance(step.get("arguments"), dict) else {}
-            tool_args = _infer_step_args(tool_name, step_text, given)
-        else:
-            step_text = str(step)
-            tool_name = classify_plan_component(step_text)
-            tool_args = _infer_step_args(tool_name, step_text, {})
-        if tool_name not in TOOL_SPECS:
-            outputs.append(f"[{idx}] Error: unknown tool '{tool_name}'.")
-            continue
-        missing = [param for param in TOOL_REQUIRED_PARAMS.get(tool_name, [])
-                   if param not in tool_args]
-        if missing:
-            result = (f"Error: plan step requires arguments for {tool_name}: "
-                      f"{', '.join(missing)}. Use a JSON step with tool and arguments.")
-            outputs.append(f"[{idx}] {tool_name}: {result}")
+    try:
+        outputs = []
+        for idx, step in enumerate(steps, 1):
+            if isinstance(step, dict):
+                step_text = str(step.get("step") or step.get("text") or "")
+                tool_name = str(step.get("tool") or classify_plan_component(step_text))
+                given = step.get("arguments") if isinstance(step.get("arguments"), dict) else {}
+                tool_args = _infer_step_args(tool_name, step_text, given)
+            else:
+                step_text = str(step)
+                tool_name = classify_plan_component(step_text)
+                tool_args = _infer_step_args(tool_name, step_text, {})
+            if tool_name not in TOOL_SPECS:
+                outputs.append(f"[{idx}] Error: unknown tool '{tool_name}'.")
+                continue
+            missing = [param for param in TOOL_REQUIRED_PARAMS.get(tool_name, [])
+                       if param not in tool_args]
+            if missing:
+                result = (f"Error: plan step requires arguments for {tool_name}: "
+                          f"{', '.join(missing)}. Use a JSON step with tool and arguments.")
+                outputs.append(f"[{idx}] {tool_name}: {result}")
+                if on_step:
+                    on_step(idx, total, step_text, tool_name, "done", result)
+                continue
             if on_step:
-                on_step(idx, total, step_text, tool_name, "done", result)
-            continue
-        if on_step:
-            on_step(idx, total, step_text, tool_name, "running", None)
-        try:
-            result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
-        except Exception as exc:
-            result = f"Error: {exc}"
-        _remember_escalation(tool_name, tool_args, result)
-        if result.startswith("ESCALATION_REQUEST:") and callable(on_escalation):
-            if on_escalation(result):
-                try:
-                    result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
-                except Exception as exc:
-                    result = f"Error: {exc}"
-        if on_step:
-            on_step(idx, total, step_text, tool_name, "done", result[:500])
-        outputs.append(f"[{idx}] {tool_name}: {result[:500]}")
-    _plan_execution_grant = False  # clear temporary grant — back to plan-only
+                on_step(idx, total, step_text, tool_name, "running", None)
+            try:
+                result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
+            except Exception as exc:
+                result = f"Error: {exc}"
+            _remember_escalation(tool_name, tool_args, result)
+            if result.startswith("ESCALATION_REQUEST:") and callable(on_escalation):
+                if on_escalation(result):
+                    try:
+                        result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
+                    except Exception as exc:
+                        result = f"Error: {exc}"
+            if on_step:
+                on_step(idx, total, step_text, tool_name, "done", result[:500])
+            outputs.append(f"[{idx}] {tool_name}: {result[:500]}")
+    finally:
+        _plan_execution_grant = False  # always clear — even on exception
     return "\n".join(outputs)
 
 
@@ -3105,7 +3146,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return "Error: This shell operation is forbidden by Agent8088's safety policy."
 
     gated_modes = ("write_text", "shell", "docker", "cron", "browser", "mcp")
-    if mode == "mcp" and spec.get("mcp_read_only"):
+    if mode == "mcp" and spec.get("mcp_read_only") and spec.get("mcp_server", "") in MCP_TRUSTED_SERVERS:
         gated_modes = tuple(item for item in gated_modes if item != "mcp")
     if mode in gated_modes and not remote_git_approved and not check_permission(
             mode, command, path_zone, bool(spec.get("host")), approval_key):
@@ -3160,12 +3201,14 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         else:
             _audit("escalation_requested", tool=name, mode=mode, decision="blocked",
                    detail=paths_str, change_type=change_type)
-            return request_escalation(
+            escalation = request_escalation(
                 target_mode="edit",
                 paths=[paths_str],
                 change_type=change_type,
                 reason=reason,
             )
+            _remember_escalation(name, args, escalation)
+            return escalation
 
     # Past every gate: this call is going to run. Recorded here rather than at
     # each execution branch so no mode can be added later without an audit line.
@@ -3430,8 +3473,11 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                     calls.append({"name": canonical, "arguments": {"command": m.group(1).replace('\\"', '"')}})
                     break
     # 5) <|mask_start|>{"tool": "...", "arguments": {...}}<|mask_end|>
+    # Greedy \{.*\} (not \{.*?\}) — non-greedy stops at the first }, truncating
+    # nested-JSON arguments like {"steps": "[{\"tool\": ...}]"} into invalid JSON.
+    # The <|mask_end|> anchor bounds the greedy match so it can't overrun.
     if not calls:
-        m = re.search(r'<\|mask_start\|>\s*(\{.*?\})\s*<\|mask_end\|>', text, re.DOTALL)
+        m = re.search(r'<\|mask_start\|>\s*(\{.*\})\s*<\|mask_end\|>', text, re.DOTALL)
         if m:
             try:
                 d = json.loads(m.group(1).strip())
@@ -3531,6 +3577,16 @@ def collect_secret_values(config: dict, env_values: dict = None) -> list:
                     "none", "ollama", "sk-dummy", "changeme", "your-api-key",
                 )):
             values.add(candidate)
+    # Also scan os.environ for env-only secrets (exported in the shell, not
+    # in config or .env). Same key-name heuristic + length floor so a 4-char
+    # value doesn't flag half of all payloads.
+    for key, value in os.environ.items():
+        if (any(part in key.lower() for part in ("key", "token", "secret", "password"))
+                and len(value) >= 4
+                and value.lower() not in (
+                    "none", "ollama", "sk-dummy", "changeme", "your-api-key",
+                )):
+            values.add(value)
     return sorted(values, key=len, reverse=True)
 
 
@@ -3581,7 +3637,7 @@ def _outbound_secret_check(payload):
     if not payload:
         return None
     text = str(payload)
-    for value in _SECRET_VALUES:
+    for value in set(_SECRET_VALUES) | set(collect_secret_values(APP_CONFIG)):
         if len(value) >= _MIN_EXFIL_SECRET_LEN and value in text:
             return ("Error: Blocked — this request contains a credential from your "
                     "configuration. Sending secrets to an external service is never "
@@ -3819,6 +3875,14 @@ def _ssrf_check(url: str):
         if hl in SSRF_ALLOW_HOSTS or (
                 parts.port and f"{hl}:{parts.port}" in SSRF_ALLOW_HOSTS):
             return None
+    # ponytail: SSRF DNS-rebinding TOCTOU — architectural limitation.
+    # We resolve host at 3842 and validate the IP, but urllib.open resolves
+    # again through the OS resolver at connect time. A DNS server with TTL=0
+    # can return a public IP here (passing the check) then 169.254.169.254
+    # (cloud metadata) on the actual connect. Proper fix: pin the resolved IP
+    # and connect to it with the original Host header (custom HTTPConnection).
+    # Not patched here — requires rewriting the urllib opener and risks the
+    # redirect handler. Mitigated by redirect re-checking each hop. Documented.
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception:

@@ -310,6 +310,7 @@ def test_approved_local_fallback_runs_once(engine, monkeypatch):
     monkeypatch.setattr(engine, "_docker_available", lambda: False)
     monkeypatch.setattr(engine, "_exec_process", lambda *_, **__: "ran locally")
     assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
+    engine._remember_escalation("run_sandboxed", {"code": "pwd"}, "ESCALATION_REQUEST:edit:local_execution:pwd:blocked")
     engine.grant_escalation("local_execution")
     assert engine._exec_sandbox_command("pwd") == "ran locally"
     assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
@@ -322,6 +323,7 @@ def test_explicit_local_backend_requires_a_one_shot_grant(engine, monkeypatch, m
     monkeypatch.setattr(engine, "_exec_process", lambda *_, **__: "ran locally")
 
     assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
+    engine._remember_escalation("run_sandboxed", {"code": "pwd"}, "ESCALATION_REQUEST:edit:local_execution:pwd:blocked")
     engine.grant_escalation("local_execution")
     assert engine._exec_sandbox_command("pwd") == "ran locally"
     assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")

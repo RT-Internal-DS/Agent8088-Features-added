@@ -388,6 +388,7 @@ def test_local_execution_grant_does_not_leak_to_later_action(engine, monkeypatch
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
     monkeypatch.setattr(engine, "_docker_available", lambda: False)
     monkeypatch.setattr(engine, "_exec_process", lambda *_args, **_kwargs: "ran")
+    engine._remember_escalation("run_sandboxed", {"code": "print(1)"}, "ESCALATION_REQUEST:edit:local_execution:sandbox:blocked")
     engine.grant_escalation("local_execution")
 
     assert engine._exec_sandbox_command("echo fake") == "ran"

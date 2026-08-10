@@ -33,6 +33,11 @@ DEDUP_MAX = 500
 
 
 def markdown_to_slack(text: str) -> str:
+    # Strip platform-native mentions/links — a model output containing a valid
+    # Slack user ID would render as a mention, pinging arbitrary users.
+    text = re.sub(r"<@[UW][A-Z0-9]+>", "", text)
+    text = re.sub(r"<#[CD][A-Z0-9]+>", "", text)
+    text = re.sub(r"<https?://[^|]+\|([^>]+)>", r"\1", text)
     fences = []
     def _stash_fence(m):
         fences.append(m.group(0))

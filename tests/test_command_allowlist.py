@@ -62,6 +62,28 @@ def test_allowlist_does_not_unlock_unrecoverable_commands(monkeypatch):
     assert A._hard_blocked_shell("rm -rf /") is True
 
 
+@pytest.mark.parametrize("command", [
+    "rm -rf /*",
+    "rm -rf $HOME",
+    "rm -rf $PWD",
+    "rm -rf .",
+    "rm -rf ~",
+    "rm -rf ./",
+    "rm  -rf  /*",
+    "rm --recursive -f /*",
+    "rm -fr /*",
+])
+def test_unrecoverable_command_blocks_glob_and_env_and_dot(command):
+    """rm -rf targeting /*, $HOME, $PWD, or . must hit the unrecoverable floor.
+
+    The shell expands these to catastrophic targets: /* -> every entry under
+    root, $HOME -> the user's home, . -> the cwd. The existing /-then-whitespace
+    regex missed them; $HOME/$PWD bypass shlex (no env expansion in the
+    classifier, so the literal var name must be matched).
+    """
+    assert A._is_unrecoverable_command(command) is True, command
+
+
 def test_allowlist_applies_to_wrapped_payloads(monkeypatch):
     """bash -c '<unlisted>' must not slip past the allowlist."""
     monkeypatch.setattr(A, "_USER_ALLOW_GLOBS", ["ls*"])
