@@ -82,6 +82,40 @@ def test_verify_sender_no_header():
     assert _verify_sender(msg) is False
 
 
+def test_verify_sender_rejects_forged_first_header():
+    from agent8088.gateway.platforms.email import _verify_sender
+    import email as email_lib
+    msg = email_lib.message.Message()
+    msg["Authentication-Results"] = "attacker.com; spf=pass"
+    msg["Authentication-Results"] = "gmail.com; dmarc=pass"
+    assert _verify_sender(msg, "imap.gmail.com") is True
+
+
+def test_verify_sender_rejects_header_from_wrong_domain():
+    from agent8088.gateway.platforms.email import _verify_sender
+    import email as email_lib
+    msg = email_lib.message.Message()
+    msg["Authentication-Results"] = "attacker.com; spf=pass"
+    assert _verify_sender(msg, "imap.gmail.com") is False
+
+
+def test_verify_sender_uses_last_header_not_first():
+    from agent8088.gateway.platforms.email import _verify_sender
+    import email as email_lib
+    msg = email_lib.message.Message()
+    msg["Authentication-Results"] = "attacker.com; dmarc=pass"
+    msg["Authentication-Results"] = "gmail.com; dmarc=fail"
+    assert _verify_sender(msg, "imap.gmail.com") is False
+
+
+def test_verify_sender_accepts_when_imap_host_unset():
+    from agent8088.gateway.platforms.email import _verify_sender
+    import email as email_lib
+    msg = email_lib.message.Message()
+    msg["Authentication-Results"] = "example.com; spf=pass"
+    assert _verify_sender(msg) is True
+
+
 def test_decode_header_value():
     from agent8088.gateway.platforms.email import _decode_header_value
     assert _decode_header_value("Hello World") == "Hello World"

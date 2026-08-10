@@ -79,17 +79,38 @@ def _is_automated_sender(from_addr: str, msg: email_lib.message.Message) -> bool
     return False
 
 
-def _verify_sender(msg: email_lib.message.Message) -> bool:
-    """Check SPF/DKIM/DMARC authentication results. Fail-closed if no header."""
-    auth_results = msg.get("Authentication-Results", "")
-    if not auth_results:
+def _host_matches_auth_res_id(host: str, auth_res_id: str) -> bool:
+    """True if auth_res_id is host or a parent domain of it, dot-anchored.
+
+    imap.gmail.com matches auth-res-id 'gmail.com' or 'imap.gmail.com',
+    but not 'fake-gmail.com'. Reuses the engine egress matching pattern.
+    """
+    h, a = host.lower(), auth_res_id.lower()
+    return h == a or h.endswith("." + a)
+
+
+def _verify_sender(msg: email_lib.message.Message, imap_host: str = "") -> bool:
+    """Check SPF/DKIM/DMARC authentication results. Fail-closed if no trusted header.
+
+    Trust only the LAST Authentication-Results header (the receiving MTA appends
+    it; a sender can forge earlier ones and msg.get() returns only the first).
+    If imap_host is set, the header's auth-res-id (the token before ';') must
+    match it or a parent domain — so a forged header from attacker.com is
+    rejected. DMARC pass is strongest (implies SPF+DKIM aligned with From);
+    bare SPF/DKIM pass are accepted when the header is provenance-verified.
+    """
+    headers = msg.get_all("Authentication-Results") or []
+    if not headers:
         return False
-    auth_lower = auth_results.lower()
-    if "dmarc=pass" in auth_lower:
+    auth_results = headers[-1]
+    parts = auth_results.split(";", 1)
+    auth_res_id = parts[0].strip().lower()
+    if imap_host and auth_res_id and not _host_matches_auth_res_id(imap_host, auth_res_id):
+        return False
+    body = auth_results.lower()
+    if "dmarc=pass" in body:
         return True
-    if "spf=pass" in auth_lower:
-        return True
-    if "dkim=pass" in auth_lower:
+    if "spf=pass" in body or "dkim=pass" in body:
         return True
     return False
 
@@ -219,7 +240,7 @@ class EmailAdapter(BaseChannelAdapter):
             return
 
         # Authentication must precede the spoofable From-header allowlist.
-        if self._verify_sender_enabled and not _verify_sender(msg):
+        if self._verify_sender_enabled and not _verify_sender(msg, self._imap_host):
             logger.warning("Email: rejected unverified sender %s (SPF/DKIM/DMARC failed)", from_addr)
             return
 
