@@ -151,8 +151,9 @@ Run these inside `agent8088`:
 | 10.1 | `/tools` | Lists all 7 tools with args, mode, and description | Tool listing |
 | 10.2 | `/tool execute_shell {"command":"echo hi"}` | Direct tool call, result shown in rich panel | Direct tool invocation |
 | 10.3 | `/tool write_file {"filename":"/tmp/slash_test.txt","content":"hello"}` | Direct write_file call via /tool | Direct tool invocation |
-| 10.4 | `/plan read tools.txt\nwrite summary to /tmp/plan_summary.txt` | Live checklist with on_step for each step, mixed readonly/write | Plan executor |
-| 10.5 | `/plan ["read tools.txt", "write summary to /tmp/plan_summary2.txt"]` | Same, but JSON array format | Plan executor (JSON) |
+| 10.4 | `/plan` | Enters plan mode, prompt shows `plan`, nothing sent to the model | Plan mode entry |
+| 10.5 | `/plan read tools.txt and write a summary to /tmp/plan_summary.txt` | Reads, then one `present_plan` panel; approve with `a` → steps run → `plan complete · permission mode back to readonly` | Plan mode round trip |
+| 10.5b | Same as 10.5, but answer `d` | `Still in plan mode — nothing above was written or run`; /tmp/plan_summary.txt absent | Plan decline is safe |
 | 10.6 | `/raw what is the capital of Mongolia` | One raw model call showing content + reasoning + tool_calls fields | Raw model call |
 | 10.7 | `/model` | Shows current backend model | Model display |
 | 10.8 | `/model gemma` | Switches to Gemma backend (if configured) | Model switch |
@@ -214,4 +215,4 @@ For a fast pass/fail across the most features:
 | 2 | `search the web for python release notes 2026` | web_search alias + network gate y/n + one-shot |
 | 3 | `mkdir /tmp/smoke_test_quick` | arg transform + no_prompt zone |
 | 4 | `write a file ./smoke_quick.txt with content "hello"` | write_file + prompt zone + escalation y/n + one-shot reverts |
-| 5 | `/plan read tools.txt\nwrite a summary to /tmp/smoke_summary.txt` | plan executor + on_step + mixed readonly/write steps |
+| 5 | `/plan read tools.txt and write a summary to /tmp/smoke_summary.txt` | plan mode + present_plan approval + execution + mode restored |
