@@ -1,7 +1,7 @@
 # Persistent Memory Design
 
 Date: 2026-08-12
-Status: Approved
+Status: Implemented
 
 ## Problem
 
@@ -204,15 +204,15 @@ re-embedding.
    individually double-quoted before it reaches FTS5, because raw user
    punctuation (`"`, `*`, `NEAR`, an unbalanced paren) is FTS5 *syntax* and
    would otherwise raise `sqlite3.OperationalError` on an ordinary question.
+   Stopwords are dropped: the tokens are OR-ed so a partial match can rank, which
+   means one shared stopword otherwise makes any query match any memory.
 2. **Vector leg.** Embed the query, load candidate vectors for that `user_id`
    whose `model` matches the active embedder, compute cosine in pure Python over
-   `array('f')` blobs, take the top 50. Vectors are stored L2-normalised at
-   write time so the read path is a dot product.
+   `array('f')` blobs, take the top 50 **with positive similarity only**. Vectors
+   are stored L2-normalised at write time so the read path is a dot product.
 3. **Fuse.** RRF as above, `memory_rrf_k` default 60.
-4. **Boost.** A mild multiplier for recency and `access_count`, so a fact
-   confirmed repeatedly outranks a stale one at equal relevance.
-5. **Cut.** Top `memory_recall_limit` (default 5), dropping anything below
-   `memory_min_score`.
+4. **Cut.** Top `memory_recall_limit` (default 5), dropping anything below
+   `memory_min_score`. Ties break toward the newer fact.
 6. **Record.** Increment `access_count` and set `last_accessed_at` on what was
    returned.
 
@@ -275,9 +275,11 @@ Runs after the final answer is produced, never before it.
   batch, and backed by `UNIQUE(user_id, hash)` so a code bug cannot bypass it.
 - **Write**: batch-embed the survivors, insert into `memories` and `vectors`,
   append `ADD` rows to `memory_events`.
-- **Threading**: a daemon thread in the CLI so answer latency is unaffected;
-  bounded and synchronous in the gateway, MCP server and cron paths, where no
-  operator is present to notice a dropped thread.
+- **Threading**: `run_agent(memory_background=...)`, a parameter rather than
+  module state. The REPL passes `True` so answer latency is unaffected; the
+  gateway, MCP server and cron leave it `False`, because nobody is watching there
+  and a daemon thread dying at process exit would drop the write without a word.
+  Synchronous is the default: it is the behaviour that cannot lose data.
 - **Cost visibility**: the extraction call's token cost is recorded and shown by
   `/memory status`, following the precedent set by
   `verification cost this turn: N%` for `plan_audit`. An extra model call per
@@ -334,7 +336,7 @@ New keys in `config.txt`, all inert by default:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `memory` | `0` | Master switch |
+| `memory` | `1` (shipped config) | Master switch |
 | `memory_db_path` | `$AGENT8088_HOME/memory.db` | Store location |
 | `memory_user_id` | `owner` | Identity that owns memories |
 | `memory_scope_by_identity` | `0` | Per-gateway-identity namespaces |
@@ -347,12 +349,20 @@ New keys in `config.txt`, all inert by default:
 | `memory_min_score` | *(tuned)* | Floor below which a hit is dropped |
 | `memory_max_per_turn` | `10` | Cap on memories written per turn |
 
-### Why `memory=0` by default
+### Why the default lives in `config.txt` rather than in code
 
-Enabling memory costs an extra model call per turn and requires a 274 MB model
-pull. An upgrade must not start doing either silently. `agent8088 --setup`
-probes for the embedder, offers to pull it, and switches memory on if the user
-agrees; `/memory on` does the same at any time.
+Memory ships **on**: `config.txt` carries `memory=1` and both installers pull the
+embedding model, so anyone who installed has working memory from the first turn.
+
+The code default stays `0`, for the same reason `audit_log`'s does: capture spends
+a model call per turn, and a bare import with no config — a test, a library use, a
+script — must not start spending it unasked. Making the code default `1` also made
+every existing test that runs a turn consume an extra scripted model response,
+which is a tax on every future test author for no gain.
+
+An older config written before this key existed is **backfilled and announced** on
+the next `--setup`, following the existing `web_search_no_prompt` pattern exactly:
+fill the gap, say so, and never overrule an explicit `memory=0`.
 
 ### Embedding model
 
@@ -448,3 +458,50 @@ which is itself a check that nothing crept in.
 | O(n) vector scan at scale | `ponytail:` comment naming the ceiling and `sqlite-vec` as the upgrade path; `/memory status` shows the row count |
 | Recall injecting noise and derailing answers | Score floor, small default limit, `/memory search` to inspect what would be injected |
 | Wrong facts persisting | `memory_events` gives full history; `/memory forget` and `/memory clear` remove them |
+
+## What changed during implementation
+
+Recorded because each of these was a design decision reversed by evidence, not a
+detail.
+
+1. **The vector leg's relevance floor.** The design said "top 50 by cosine". A test
+   with an unrelated memory showed that reporting the top N regardless of whether
+   anything matched hands rank 1 to noise on a small store, and RRF then credits it
+   as a real hit. Only positive similarity counts now. The floor is at zero rather
+   than a tuned threshold because real embedders place unrelated text anywhere from
+   0.2 to 0.6 depending on the model — any higher constant would encode an
+   assumption about one model.
+
+2. **The recency/frequency boost is gone.** The design specified a multiplier
+   "bounded to roughly 1.0-1.4" that would "only break near-ties". It does not:
+   adjacent RRF ranks differ by about 1.6% at `k=60`, so a 1.4x multiplier reorders
+   genuinely better matches. A test with a frequently-read irrelevant memory proved
+   it beat a directly relevant one. Recency is now a tie-break on exactly equal
+   scores, which is the one thing it can do without overturning relevance.
+
+3. **Stopwords are stripped from the keyword leg.** Not anticipated at all. Because
+   the tokens are OR-ed, `"what is the capital of France"` matched a memory about
+   `uv` on the word `"the"` — and on a small store BM25 has nothing better to rank,
+   so the irrelevant memory reached the prompt.
+
+4. **Connections are thread-local.** The design's own docstring claimed connections
+   were "not shared across threads, which is what capture running on a background
+   thread needs", and the implementation then cached one in module state. `sqlite3`
+   objects belong to the thread that created them, and because capture catches
+   broadly, the symptom would have been memory silently never being written rather
+   than a crash. The first test written for this passed against the bug, because it
+   happened to close the connection before the main thread read — the test that
+   catches it has to open a connection on the main thread first, which is the real
+   per-turn sequence (recall, then capture).
+
+5. **`memory_background` is a parameter, not a module global.** The first version set
+   `engine.MEMORY_CAPTURE_BACKGROUND = True` at CLI import. A test asserting it
+   proved order-dependent, because any test using the `engine` fixture reloads the
+   module and resets it. The smell was real: it is caller policy, so it belongs in
+   the call.
+
+6. **No setup-wizard prompt.** The design had `--setup` ask about memory. The repo
+   already had a better pattern for exactly this — `web_search_no_prompt` is
+   backfilled and announced rather than prompted — and a prompt in a wizard people
+   run to change their model is a question for nothing when the answer is on by
+   default. Backfill also fixes the upgrade path, which a prompt does not.
