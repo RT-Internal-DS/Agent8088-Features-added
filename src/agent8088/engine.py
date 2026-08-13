@@ -229,11 +229,14 @@ def _migrate_keys_to_env(config_path: Path, env_path: Path) -> int:
     return migrated
 
 
-# Config path: AGENT8088_CONFIG env var > ~/.agent8088/config.txt > %LOCALAPPDATA%/agent8088/config.txt > APP_DIR/config.txt
+# Config path: AGENT8088_CONFIG env var > AGENT8088_HOME/config.txt >
+# ~/.agent8088/config.txt > %LOCALAPPDATA%/agent8088/config.txt > APP_DIR/config.txt
 _user_config = Path.home() / ".agent8088" / "config.txt"
 _win_config = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"
 if os.environ.get("AGENT8088_CONFIG"):
     CONFIG_PATH = Path(os.environ["AGENT8088_CONFIG"]).expanduser()
+elif os.environ.get("AGENT8088_HOME"):
+    CONFIG_PATH = Path(os.environ["AGENT8088_HOME"]).expanduser() / "config.txt"
 elif _user_config.exists():
     CONFIG_PATH = _user_config
 elif _win_config.exists():
