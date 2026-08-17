@@ -1,6 +1,15 @@
 # Multi-Model Provider Support
 
-Agent8088 supports 13 built-in model providers through a unified provider registry. Switch between providers without changing code — just update config or use the interactive picker.
+> **See [wiki/05-model-providers.md](wiki/05-model-providers.md) for the
+> canonical, verified-against-source reference.** This page predates that
+> rewrite and has drifted (it previously listed 13 providers including a
+> phantom `anthropic` built-in, and named provider-registry functions that
+> don't exist in `providers.py`). It's kept for the extra detail below on
+> model caching, fallback chains, and adding a custom provider — cross-check
+> anything provider-identity-related (base URLs, key env vars) against the
+> wiki page, not here.
+
+Agent8088 supports 12 built-in model providers through a unified provider registry. Switch between providers without changing code — just update config or use the interactive picker.
 
 ---
 
@@ -11,16 +20,19 @@ Agent8088 supports 13 built-in model providers through a unified provider regist
 | 1 | Ollama (local) | `http://localhost:11434/v1` | none (or `ollama`) | `qwen14b-tooluse-v3` |
 | 2 | OpenRouter | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | `anthropic/claude-sonnet-4` |
 | 3 | OpenAI | `https://api.openai.com/v1` | `OPENAI_API_KEY` | `gpt-4o` |
-| 4 | Anthropic (Claude) | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` |
-| 5 | Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `GEMINI_API_KEY` | `gemini-2.0-flash` |
-| 6 | Cerebras | `https://api.cerebras.ai/v1` | `CEREBRAS_API_KEY` | `gpt-oss-120b` |
-| 7 | DeepSeek | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` | `deepseek-chat` |
-| 8 | Groq | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | `llama-3.3-70b-versatile` |
-| 9 | Mistral | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` | `mistral-small-latest` |
-| 10 | Moonshot (Kimi) | `https://api.moonshot.ai/v1` | `MOONSHOT_API_KEY` | `kimi-k2.6` |
-| 11 | Qwen (DashScope) | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` | `qwen-plus` |
-| 12 | Ollama Cloud | `https://ollama.com/v1` | `OLLAMA_API_KEY` | `gpt-oss:120b` |
-| 13 | GitHub Copilot | `https://api.githubcopilot.com` | `GH_TOKEN` | `gpt-4o-mini` |
+| 4 | Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `GEMINI_API_KEY` | `gemini-2.0-flash` |
+| 5 | Cerebras | `https://api.cerebras.ai/v1` | `CEREBRAS_API_KEY` | `gpt-oss-120b` |
+| 6 | DeepSeek | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` | `deepseek-chat` |
+| 7 | Groq | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | `llama-3.3-70b-versatile` |
+| 8 | Mistral | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` | `mistral-small-latest` |
+| 9 | Moonshot (Kimi) | `https://api.moonshot.ai/v1` | `MOONSHOT_API_KEY` | `kimi-k2.6` |
+| 10 | Qwen (DashScope) | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` | `qwen-plus` |
+| 11 | Ollama Cloud | `https://ollama.com/v1` | `OLLAMA_API_KEY` | `gpt-oss:120b` |
+| 12 | GitHub Copilot | `https://api.githubcopilot.com` | `GH_TOKEN` | `gpt-4o-mini` |
+
+There is no built-in `anthropic` provider. Claude is reachable via OpenRouter
+or a custom OpenAI-compatible endpoint — see
+[wiki/05-model-providers.md § Reaching Anthropic / Claude](wiki/05-model-providers.md).
 
 All providers use the OpenAI-compatible API format. Agent8088 uses the `openai` Python SDK with different `base_url` and `api_key` per provider — no dedicated adapters needed.
 
@@ -81,7 +93,7 @@ provider.my-provider.api_key=your-key
 The setup wizard uses a fuzzy searchable picker (powered by InquirerPy):
 
 1. **Working directory** — where the agent can read/write files
-2. **Provider** — fuzzy search through all 13 providers, arrow keys to navigate, Enter to select
+2. **Provider** — fuzzy search through all 12 providers, arrow keys to navigate, Enter to select
 3. **API key** — for the selected provider
 4. **Model** — fetches the provider's available models via `/v1/models`, shows them in a fuzzy picker
 5. **Web search URL** — optional SearXNG endpoint
@@ -166,19 +178,21 @@ If Cerebras returns 429, agent8088 switches to Groq. If Groq also fails, it trie
 
 The provider registry module:
 
-- `BUILTIN_PROVIDERS` — dict of 13 providers with base_url + api_key_env
-- `PROVIDERS` — runtime registry, loaded from config + built-in defaults
-- `load_providers(config)` — scans config.txt for `provider.<name>.*` keys
-- `get_client_for(model_ref, timeout)` — returns `(OpenAI client, model_name)` for a `provider:model` ref
-- `list_models(provider_name, client)` — fetches `/v1/models`, caches to disk, falls back to hardcoded list
-- `get_fallback_chain(config)` — parses `fallback_models` config
-- `_normalize_model_id(provider_name, model_id)` — strips `models/` prefix for Gemini only
+- `BUILTIN_PROVIDERS` — dict of 12 providers with base_url + api_key_env
+- `load_providers(config, include_builtins=True)` — scans config.txt for `provider.<name>.*` keys and merges with the built-ins
+- `list_models(provider_name, client=None, ...)` — fetches `/v1/models`, caches to disk, falls back to a hardcoded list
+- `_normalize_model_id(provider_name, model_id)` — strips a `models/` prefix for Gemini only
+
+The runtime registry and the client/fallback logic that consume it live in
+`engine.py`, not `providers.py`:
 
 ### `src/agent8088/engine.py`
 
-- `get_client()` calls `providers.get_client_for(MODEL_REF)`
-- `create_completion()` accepts a `model` parameter for fallback switching
-- `run_agent()` catches 429/503/connection errors and tries the fallback chain
+- `PROVIDERS = load_providers(APP_CONFIG, include_builtins=True)` — the actual runtime registry
+- `_provider_api_key(provider)` — resolves a provider's key using the precedence in [wiki/02-configuration.md#resolution-order](wiki/02-configuration.md)
+- `get_client(provider=None)` — returns the client for the active or named provider
+- `_fallback_targets()` — parses `fallback_models` into the retry chain
+- the agent loop catches 429/503/connection errors and walks that chain
 
 ### `src/agent8088/cli.py`
 
@@ -193,7 +207,7 @@ The provider registry module:
 
 | Feature | Agent8088 | Hermes | OpenClaw |
 |---|---|---|---|
-| Providers | 13 built-in | 33+ (plugin system) | 40+ (plugin system) |
+| Providers | 12 built-in | 33+ (plugin system) | 40+ (plugin system) |
 | Adapter type | Single OpenAI SDK + provider registry | ProviderProfile registry + dedicated adapters | registerProvider() plugin system |
 | Model picker | InquirerPy fuzzy search | `hermes model` wizard | `openclaw onboard` wizard |
 | In-session switch | `/model` + `/models` | `/model` | `/model` |

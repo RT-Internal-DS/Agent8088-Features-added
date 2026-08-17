@@ -1,5 +1,11 @@
 # Testing Agent8088
 
+> See [docs/wiki/12-testing-and-verification.md](docs/wiki/12-testing-and-verification.md)
+> for the fuller, actively-maintained per-area test list (permissions, SSRF,
+> egress, exfil guard, turn budget, audit log, capabilities, MCP, gateway,
+> env key store, memory). This page is kept for the CLI manual-testing
+> checklist below, which the wiki page doesn't duplicate.
+
 Two suites, both runnable with no model backend and no network.
 
 ## 1. Unit tests (fast and hermetic)
@@ -54,8 +60,8 @@ agent8088
 
 | Try | What to expect |
 |---|---|
-| `/tools` | 20 tools listed |
-| `/agents` | 4 sub-agent profiles |
+| `/tools` | 21 tools listed |
+| `/agents` | 5 sub-agent profiles |
 | `/agent` | arrow-key picker (↑/↓/⏎/esc), then prompts for a task |
 | `/agent explore list the python files here` | nested animated magenta trace, then a summary |
 | `/skills` | installed skill packages (none by default) |
@@ -67,7 +73,7 @@ agent8088
 | `/tool git_status` | real git output |
 | `/tool web_search query="python 3.13"` | clean `• title / url / snippet` list |
 | `/tool web_search` (no arg) | names the missing arg: `pass query=<value>` |
-| `/tool web_search_tavily query="..."` | needs `tavily_api_key`, else a clear message |
+| `/tool web_search query="..."` | routes to a configured backend; falls back to keyless `ddgs` |
 | `/tool schedule_task action=list` | your Agent8088 schedules |
 | `Tab` after `/agent `, `/tool `, `/model ` | autocompletion |
 
@@ -98,8 +104,11 @@ use a subagent to count the TODOs here
   tool tells you how to install it and suggests `web_search`.
 - **Vision**: `/image` needs a vision-capable provider configured (see `/model`); the
   default local text model will error.
-- **SSRF**: `config.txt` allows only `127.0.0.1,localhost` for a local SearXNG;
-  add a LAN host explicitly when needed. `ssrf_allow_private` stays `0` so every
-  other private address remains blocked.
-- **Search**: the LAN SearXNG is unreachable off that network — `web_search` will report
-  `No response from ...`. Set `tavily_api_key` or `exa_api_key` for a hosted fallback.
+- **SSRF**: `ssrf_allow_hosts` allows only the hosts listed there for a local
+  SearXNG; add a LAN host explicitly when needed. `ssrf_allow_private` stays
+  `0` so every other private address remains blocked.
+- **Search**: `web_search` has four interchangeable backends (searxng, ddgs,
+  tavily, exa) — see [Self-hosting SearXNG locally](docs/wiki/04-tools.md#self-hosting-searxng-locally).
+  If SearXNG is unreachable, the bundled keyless `ddgs` backend serves instead
+  automatically. Set `TAVILY_API_KEY` or `EXA_API_KEY` in the `.env` store for
+  a hosted fallback.
