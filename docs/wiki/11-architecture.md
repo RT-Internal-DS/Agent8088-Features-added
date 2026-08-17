@@ -32,6 +32,8 @@ than a design choice.
 | `engine.py` | Agent loop, tool dispatch, permission layer, security floors, providers, HTTP/SSRF |
 | `cli.py` | REPL, slash commands, setup wizards, rendering |
 | `providers.py` | The 12 built-in provider profiles |
+| `web_search.py` | Web search provider registry — searxng/tavily/exa/ddgs, selection precedence, the fallback chain |
+| `searxng_provision.py` | Provisions and manages the local SearXNG Docker container for `/search setup` |
 | `mcp.py` | MCP **client** — connect external servers |
 | `mcp_server.py` | MCP **server** — expose our tools outward |
 | `gateway/runner.py` | Inbound routing, approval registry, adapter registration |
@@ -45,6 +47,8 @@ than a design choice.
 | `tools.txt` | Tool registry (data, not code) |
 | `system.md` | Base system prompt |
 | `config.txt` | Default settings |
+| `agents/*.md` | Sub-agent profiles (frontmatter: tools, max_turns, permission) — see [Skills & Sub-agents](09-skills-and-subagents.md) |
+| `skills_installed/*/SKILL.md` | Bundled skill packages |
 
 ## The agent loop
 
@@ -237,8 +241,6 @@ interactive tool. Two exceptions:
 
 Honest list, for anyone extending this:
 
-- **No persistent memory.** `USER.md` is read, never written. There is no
-  cross-session recall, and nothing layers short-term against archival storage.
 - **No cross-run cost accounting.** `/usage` reports session tokens and
   `max_turn_cost_usd` bounds a single turn, but nothing aggregates spend across
   runs. Enabling `model_telemetry` writes the per-call records that would make

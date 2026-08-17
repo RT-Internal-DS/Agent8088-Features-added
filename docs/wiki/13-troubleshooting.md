@@ -78,6 +78,39 @@ are dropped rather than half-registered. `api_mode=litellm` is the one exception
 Only **retryable** errors trigger it: HTTP 429, 503, connection errors. A 401 or
 400 is deterministic — retrying elsewhere would just waste a call.
 
+## Memory
+
+### Memory never seems to learn anything
+
+Run `/memory test` first — it runs one real extraction call and shows the raw
+model reply, what parsed out of it, and how long it took. A model that can't
+produce the expected JSON stores nothing and says nothing, which looks
+identical to a turn that had nothing worth keeping. If it reports the model
+replied without usable JSON, point `memory_extract_model` at a stronger model.
+Full walkthrough in [Memory § When memory seems to be learning nothing](16-memory.md#when-memory-seems-to-be-learning-nothing).
+
+### `/memory search` shows `—` in the Meaning column
+
+The embedder isn't answering, so recall has silently degraded to
+keyword-only search. Check `memory_embed_provider` and `memory_embed_model` —
+the default (`ollama` / `nomic-embed-text`) needs a reachable Ollama instance
+with that model pulled. `/memory` reports the embedder's status explicitly and
+names the fix.
+
+### Memory recall used the wrong provider
+
+`memory_embed_provider` is deliberately **not** your chat provider — embeddings
+are a separate service from chat, and the default embed model
+(`nomic-embed-text`) is an Ollama model regardless of what serves chat. If
+recall is failing right after switching chat providers, check
+`memory_embed_provider` wasn't accidentally pointed at the new one.
+
+### Memory notifications are too noisy or too quiet
+
+`/memory notify [off|on|verbose]` changes it live — `off` is silent, `on` is a
+one-line count, `verbose` shows the facts themselves plus a line on turns that
+stored nothing.
+
 ## Permissions
 
 ### Every write asks for approval
@@ -218,6 +251,16 @@ default. Remote binds are intentionally rejected because the bundled HTTP
 transport has no authentication.
 
 ## Gateway
+
+### Gateway starts but no platform connects
+
+Check the startup log for a line like `Slack enabled but slack-bolt not
+installed. Run: uv pip install -e ".[gateway]"` (the same pattern applies per
+platform: `httpx` for WhatsApp, `discord.py` for Discord, `python-telegram-bot`
+for Telegram). A `*_enabled=1` flag with its package missing is skipped
+silently rather than crashing the process — the gateway can come up with zero
+adapters connected and no other symptom. If no platform is enabled at all, the
+process instead exits immediately naming every `*_enabled` key to set.
 
 ### Bot silently ignores someone
 

@@ -19,22 +19,26 @@ is what the permission layer gates on — see
 | `web_search` | `search` | `query` | prompt by default | Routes to the configured backend and falls back automatically. A pinned loopback or allowlisted private-LAN SearXNG can opt into no-prompt search with `web_search_no_prompt=1`. See [Web search backends](#web-search-backends). |
 | `get_page_title` | `http_get` | `url` | prompt | Fetch just a page's `<title>`. |
 | `browse_page` | `browser` | `url` | prompt | Headless browser — renders JS that curl can't. |
-| `run_sandboxed` | `docker` | `code` | prompt | Run code in the sandbox. |
-| `schedule_task` | `cron` | `action`, `schedule`, `task` | prompt | Add/list/remove a scheduled run. |
+| `run_sandboxed` | `docker` | `code` | prompt | Run a Python snippet with native OS isolation and no network, using Docker only as a fallback. Use for untrusted or risky code instead of `execute_shell`. |
+| `schedule_task` | `cron` | `action`, `schedule`, `task` | `action=list` only | Add/list/remove a scheduled run. Listing is readonly-safe; adding or removing is a scheduled side effect and needs approval. |
 | `spawn_subagent` | `subagent` | `agent_type`, `task` | prompt | Delegate to an isolated sub-agent. |
 | `present_plan` | `plan` | `plan` | ✅ | Show a plan as markdown and ask the user to approve it (plan mode's exit point). |
 | `execute_plan` | `plan` | `steps` | ✅ | Run an already-decided sequence of tool calls, verified step by step. |
-| `git_status` | `shell` | — | depends | `git status`. |
-| `git_diff` | `shell` | — | depends | `git diff`. |
-| `git_log` | `shell` | — | depends | `git log`. |
+| `git_status` | `shell` (host) | — | ✅ | `git status`. |
+| `git_diff` | `shell` (host) | — | ✅ | `git diff`. |
+| `git_log` | `shell` (host) | — | ✅ | `git log`. |
 | `git_clone` | `shell` | `url`, `directory` | prompt | Clone a repo. |
 | `git_commit` | `shell` | `message` | prompt | Commit staged changes. |
 | `git_push` | `shell` | — | **blocked** | Refused at the always-on floor. |
 | `git_create_pr` | `shell` | `title`, `body` | prompt | Open a PR via `gh`. |
 
-> `git_status`/`git_diff`/`git_log` depend on the sandbox backend: allowed
-> without a prompt under the native sandbox, escalated under `local`, because
-> reading a repo unsandboxed can surface credential content.
+> `git_status`/`git_diff`/`git_log` are declared `host=1` in `tools.txt` and
+> always run directly on the host, without a prompt, regardless of sandbox
+> availability or backend — see
+> [Sandboxing § Interaction with git tools](06-sandboxing.md#interaction-with-git-tools).
+> The equivalent command run through `execute_shell` (e.g.
+> `execute_shell({"command": "git status"})`) is a generic shell call instead,
+> and follows the normal sandbox-dependent rule.
 
 ## Aliases
 
@@ -45,15 +49,26 @@ The model can call tools by natural names; they resolve to the canonical tool:
 | `bash`, `sh`, `shell`, `run` | `execute_shell` |
 | `search`, `web`, `google` | `web_search` |
 | `read`, `cat` | `read_text` |
-| `write`, `create_file` | `write_file` |
+| `write`, `create_file`, `writefile` | `write_file` |
 | `calc`, `eval`, `math` | `calculate` |
+| `last`, `prev_output` | `last_output` |
 
-## Argument transforms
+## Argument fallbacks
 
-Some plausible-but-wrong shapes are rewritten rather than rejected — e.g.
-`mkdir({path: "x"})` becomes `execute_shell({command: "mkdir x"})`. This is why
-the agent recovers instead of looping when the model invents a tool that
-*sounds* right.
+There is no shape-rewriting resolver — a tool called with a fictitious shape
+(e.g. an invented `mkdir` tool) still fails. What *does* recover is per-tool
+argument-name fallbacks, so a model that reaches for a plausible but wrong key
+still gets through:
+
+- `read_text` / `write_file` accept `path` or `filepath` as fallbacks for
+  `filename`.
+- `run_sandboxed` accepts `script`, `python`, `source`, `snippet`, or `command`
+  as fallbacks for `code`, and strips a wrapping markdown code fence
+  (` ```python ... ``` `) before running it.
+
+Combined with the tool-name aliases above, this is why the agent recovers
+instead of looping when the model invents a plausible-sounding argument name
+for a real tool.
 
 ## Tool modes explained
 
@@ -171,7 +186,7 @@ configuration rather than by the model picking a per-vendor tool:
 
 | Backend | Role | Requires |
 |---|---|---|
-| `searxng` | **default** | Docker (`/search setup` provisions it) or an instance URL |
+| `searxng` | **default** | Docker (`/search setup` provisions it) or an instance URL in `search_base_url` |
 | `ddgs` | **fallback** | nothing — ships with agent8088 |
 | `tavily` | optional — **first priority once its key is set** | `TAVILY_API_KEY` in the `.env` store |
 | `exa` | optional — **priority once its key is set**, behind `tavily` | `EXA_API_KEY` in the `.env` store |
@@ -208,6 +223,133 @@ is visible.
 Because `ddgs` needs no key, no hosting, and no setup, web search works on a
 fresh install. Run `/search status` for the live chain, `/search doctor` to
 diagnose, and `/search use <backend>` to pin one.
+
+## Self-hosting SearXNG locally
+
+SearXNG is a free, self-hosted meta-search engine — it queries 70+ other
+search engines and merges the results, with no API key and no query ever
+leaving a machine you control. It's the default `web_search` backend because
+of that: no signup, no per-query cost, and no third party sees what the agent
+searched for.
+
+The upstream Docker image is not usable out of the box for this purpose — it
+ships with JSON output **disabled** and a bot limiter **enabled**, so a bare
+`docker run searxng/searxng` produces an instance that returns HTML pages
+agent8088 can't parse, and eventually starts answering with HTTP 429. Agent8088's
+provisioning writes the one settings file that fixes both, then starts the
+container — that's `src/agent8088/searxng_provision.py` if you want to read
+the exact logic.
+
+### Option 1 — let agent8088 provision it (recommended)
+
+Requires Docker. Everything else is automatic:
+
+```
+/search setup
+```
+
+This:
+
+1. Writes `~/.agent8088/searxng/settings.yml` with `search.formats: [html, json]`,
+   `server.limiter: false`, and a freshly generated random `secret_key` (mode
+   `0600`). If the file already exists, its `secret_key` is preserved — a
+   restart doesn't invalidate anything or clobber a file you've customized.
+2. Runs the `searxng/searxng:latest` image as a container named
+   `agent8088-searxng`, published to **`127.0.0.1:8888` only** — never
+   `0.0.0.0`. SearXNG's JSON API has no authentication, so binding it to all
+   interfaces would put an unauthenticated search proxy on your local network.
+3. Polls the JSON API until it answers (up to ~30s), and reports readiness.
+4. Sets `search_base_url=http://127.0.0.1:8888/search?q=` in `config.txt` and
+   picks `searxng` as the active backend.
+
+Check on it any time:
+
+```
+/search status     # which backend is active, and why
+/search doctor      # diagnose a broken instance
+/search stop        # remove the container
+```
+
+The container restarts automatically (`--restart unless-stopped`) across
+reboots and agent8088 upgrades — you generally never need to touch Docker
+directly.
+
+### Option 2 — provision it by hand
+
+Useful if you want to run SearXNG under your own orchestration (systemd,
+Compose, a NAS app store, a remote box) instead of the container agent8088
+manages. The two settings that matter are the ones the upstream defaults get
+wrong for this use case:
+
+```yaml
+# settings.yml
+use_default_settings: true
+server:
+  secret_key: "<a long random string — do not use the upstream placeholder>"
+  limiter: false        # off, so the JSON API doesn't get rate-limited/blocked
+  image_proxy: true
+search:
+  formats:
+    - html
+    - json               # NOT enabled by default upstream — required
+```
+
+Then run the container yourself, bound to loopback (or your own LAN with a
+firewall in front of it — the JSON API has no auth of its own):
+
+```bash
+docker run -d --name my-searxng --restart unless-stopped \
+  -p 127.0.0.1:8888:8080 \
+  -v /path/to/settings-dir:/etc/searxng \
+  searxng/searxng:latest
+```
+
+Verify the JSON API actually answers before pointing agent8088 at it:
+
+```bash
+curl "http://127.0.0.1:8888/search?q=test&format=json"
+```
+
+If that returns HTML instead of JSON, `search.formats` doesn't include `json`
+yet — this is the single most common misconfiguration. If it returns HTTP 403
+or 429, `server.limiter` is still `true`.
+
+### Pointing agent8088 at your instance
+
+Whether it's the container you ran by hand, one on another machine, or a
+public/shared instance someone else operates:
+
+```ini
+# config.txt
+search_base_url=http://127.0.0.1:8888/search?q=
+web_search_provider=auto      # or: searxng, to pin it explicitly
+```
+
+Rules enforced regardless of how the instance was provisioned:
+
+- **A remote (non-loopback, non-private) host must use `https://`.** Plaintext
+  `http://` is only accepted for `localhost`/`127.0.0.1`/private-network
+  addresses — SearXNG puts every query on the wire in cleartext, which is fine
+  on a box you control and not fine over the open internet.
+- **The host must be reachable under the SSRF policy** — present in
+  `ssrf_allow_hosts`, or a private/loopback address if `ssrf_allow_private=1`.
+  Otherwise requests to it are blocked as an internal-network access attempt
+  before they're even sent. See [Configuration § Security](02-configuration.md).
+- **Approval-free search (`web_search_no_prompt=1`) only applies to a pinned
+  loopback or explicitly allowlisted private-LAN instance.** It can never
+  apply to a public host, because that would mean silently sending queries to
+  a third party. See [Permissions & Security](03-permissions-and-security.md).
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| "SearXNG did not return JSON" | `search.formats` doesn't include `json` | Add `json` to `search.formats` in `settings.yml`, restart the container |
+| HTTP 403 / 429 from SearXNG | The bot limiter is on | Set `server.limiter: false` in `settings.yml` |
+| "Could not reach SearXNG at …" | Container stopped, wrong port, or firewall | `/search doctor`, or `docker logs agent8088-searxng` if hand-run |
+| Container keeps restarting | Usually a malformed `settings.yml` | `docker logs agent8088-searxng` for the crash reason; delete and let `/search setup` regenerate it if you didn't hand-edit it |
+| Search silently falls back to `ddgs` | `web_search_provider=auto` and SearXNG failed its startup liveness probe | Fix the instance, then restart the CLI/gateway so `auto` re-probes and re-pins |
+| Every search asks for approval even though SearXNG is up | `web_search_no_prompt` is `0`, or the pinned instance isn't loopback/allowlisted | Set `web_search_no_prompt=1` and confirm the host is loopback or in `ssrf_allow_hosts` |
 
 ## How the agent chooses a tool
 

@@ -21,7 +21,9 @@ pip install -e ".[gateway]"
 
 `--gateway-setup` is a single-select picker: choosing Slack disables WhatsApp,
 Discord, Email and Telegram. This is deliberate — one agent identity per
-running gateway keeps session keys and approvals unambiguous.
+running gateway keeps session keys and approvals unambiguous. This is enforced
+by the wizard, not by `--gateway` itself — hand-editing `config.txt` to set
+more than one `*_enabled=1` is possible and untested; don't.
 
 ## Access control — fail closed
 
@@ -143,7 +145,7 @@ refused. See [Permissions & Security](03-permissions-and-security.md#audit-trail
 | Threads | ✅ `thread_ts` | ❌ | ❌ | ✅ `In-Reply-To` | ✅ `message_thread_id` |
 | Approval UI | text | text | **buttons** | text | text |
 | Markdown | `markdown_to_slack()` | `markdown_to_whatsapp()` | `markdown_to_discord()` | plain text | `markdown_to_telegram()` |
-| Dedup | by `ts`, 500-entry cap | by message id | by message id, 500-entry cap | by UID | by `update_id`, 500-entry cap |
+| Dedup | by `ts`, 500-entry cap | by message id | by message id, 500-entry cap | by UID, 2,000-entry cap | by `update_id`, 500-entry cap |
 
 ### Slack
 
@@ -151,12 +153,22 @@ Create an app at [api.slack.com/apps](https://api.slack.com/apps):
 
 1. **OAuth & Permissions** → scopes: `chat:write`, `app_mentions:read`,
    `channels:history`, `channels:read`, `im:history`, `im:read`
-2. **Socket Mode** → enable, create an `xapp-` token
+2. **Socket Mode** → enable, create an `xapp-` token — Slack does **not**
+   auto-select a scope for this token, so explicitly check
+   **`connections:write`** when generating it. Without that scope the
+   connection fails at startup.
 3. **Event Subscriptions** → `message.im`, `message.channels`, `app_mention`
 4. **App Home** → enable the Messages tab
 5. **Install App** → copy the `xoxb-` token
 
-Socket Mode means no public URL or tunnel is needed.
+```ini
+slack_enabled=1
+slack_allowed_users=U01ABC2DEF3
+```
+
+`--gateway-setup` prompts for both tokens and writes `slack_enabled` for you;
+if either token is left blank it sets `slack_enabled=0` instead. Socket Mode
+means no public URL or tunnel is needed.
 
 **It only responds to DMs and @mentions** — not every message in a channel it's
 in. It also ignores its own messages, so no feedback loops, and strips the
@@ -164,9 +176,15 @@ mention from the text before the model sees it.
 
 ### WhatsApp
 
-Uses a local Node.js bridge (Baileys) — no Meta Business account.
+Uses a local Node.js bridge (Baileys) — no Meta Business account, no bot token.
+
+**Requires Node.js 18+ on PATH.** This is a separate toolchain from the
+`pip install -e ".[gateway]"` extra that covers every other platform —
+`--gateway-setup` refuses to proceed for WhatsApp without it
+("`ERROR: Node.js not found. Install Node.js 18+ first: https://nodejs.org/`").
 
 ```ini
+whatsapp_enabled=1
 whatsapp_mode=self-chat        # or: bot
 whatsapp_session_dir=~/.local/share/agent8088/whatsapp/session
 whatsapp_bridge_port=3000
@@ -176,18 +194,39 @@ whatsapp_bridge_port=3000
   private assistant in your own "Message yourself" chat.
 - **`bot`** — accepts from anyone; the Python allowlist gates access.
 
-Pairing is a QR scan on first run. Re-pairing wipes the **entire** session
-directory, because stale app-state-sync keys otherwise cause "failed to find
-key" errors that silently block message receipt.
+`--gateway-setup` runs `npm install` for you in
+`src/agent8088/gateway/platforms/whatsapp_bridge/` the first time (skipped if
+`node_modules/` already exists), then launches `node bridge.js --pair --session
+<dir>` and waits for a QR code to scan (**Phone → Settings → Linked Devices →
+Link a Device**). If the automatic `npm install` fails, it prints the same
+command to run by hand in that directory.
 
-The bridge auto-restarts after 5 consecutive poll errors, and resolves opaque
-WhatsApp LIDs back to phone numbers so allowlist matching works.
+Pairing is done once by the setup wizard, not by the running gateway — the
+gateway itself only reuses an existing session and will not start pairing on
+its own if none exists. Re-pairing wipes the **entire** session directory,
+because stale app-state-sync keys otherwise cause "failed to find key" errors
+that silently block message receipt.
+
+The bridge binds `127.0.0.1` only and auto-restarts after more than 5
+consecutive poll errors (the 6th), and resolves opaque WhatsApp LIDs back to
+phone numbers so allowlist matching works.
 
 ### Discord
 
-1. Create an app at [discord.com/developers](https://discord.com/developers)
-2. Enable the **Message Content** intent (required)
-3. Copy the bot token, invite the bot to your server
+1. Create an application at [discord.com/developers](https://discord.com/developers) → **New Application**.
+2. **Bot** tab → **Add Bot** (creating the application does not create a bot
+   user — this is a separate step) → copy the bot token.
+3. Same **Bot** tab → under Privileged Gateway Intents, enable **Message
+   Content Intent** (required — without it the bot connects but receives no
+   message text, and the client raises an unhandled error at startup).
+4. **OAuth2** → **URL Generator** → scopes: check `bot` → bot permissions:
+   check `Send Messages` and `Read Message History` → open the generated URL
+   and select your server to invite the bot.
+
+```ini
+discord_enabled=1
+discord_allowed_users=123456789012345678
+```
 
 DMs are always accepted; in guild channels it **requires an @mention**.
 

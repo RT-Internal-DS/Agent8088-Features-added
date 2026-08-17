@@ -53,6 +53,15 @@ docker_network=none
 `docker_network=none` is the safer default — no network from inside the
 container at all.
 
+Every Docker run is also hardened regardless of config: `--memory 512m --cpus 1
+--pids-limit 256 --cap-drop ALL --security-opt no-new-privileges`. Before the
+container starts, the mounted workspace is walked and an empty read-only file
+is bind-mounted over every path matching the sensitive-file floor (credential
+files, shell startup files, etc.), so a command inside the container cannot
+read them even though the workspace itself is mounted in. If more than 128 such
+paths would need masking, the run is refused outright rather than masking a
+subset and calling it safe.
+
 ## Network egress
 
 Sandboxed commands have no network unless you allow specific domains:
@@ -93,9 +102,18 @@ Worth being precise, because it's easy to over-trust:
 
 ## Interaction with git tools
 
-Under the native sandbox, `git status` / `git diff` / `git log` run without a
-prompt. If no sandbox is available they are refused; `git show HEAD:.env` is
-separately blocked outright in every backend.
+The dedicated `git_status` / `git_diff` / `git_log` tools always run directly
+on the host, without a prompt and regardless of sandbox availability — reading
+a repo's history isn't something a sandbox needs to mediate, and refusing them
+for lack of a sandbox made `git_status` demand approval in readonly, the mode
+it's most useful in. `git show HEAD:.env` is separately blocked outright in
+every backend.
+
+This host bypass is specific to those three fixed tools. Running the
+equivalent command through `execute_shell` (e.g.
+`execute_shell({"command": "git status"})`) is a generic shell invocation and
+follows the normal rule: allowed under the native sandbox, refused if no
+sandbox is available.
 
 ## Verifying it works
 

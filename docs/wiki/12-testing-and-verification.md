@@ -51,6 +51,7 @@ AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/gateway/ -q         
 AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_env_key_store.py -q   # .env store + redaction
 AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_providers.py -q       # providers + key precedence
 AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_subagents.py -q       # sub-agents + guardrails
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_memory.py -q          # persistent memory: store, recall, RRF
 ```
 
 ### Gateway extras are required

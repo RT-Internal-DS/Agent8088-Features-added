@@ -34,6 +34,10 @@ Note that **network reads are refused too** — `web_search` and
 `get_page_title` need approval in readonly, because fetching a URL is an
 outbound side effect and a route for untrusted content.
 
+`read_text` is allowed unconditionally only while [`read_paths`](02-configuration.md#paths-and-workspace)
+is unset. Once it's configured, a read outside that zone escalates like a
+write would — readonly does not exempt it.
+
 Shell is the exception that has nuance: a command on the readonly-safe list
 runs without a prompt. That list is inspection-only:
 
@@ -417,7 +421,7 @@ turn if its local file cannot be written.
 ## Content defense
 
 Text that came from outside the model's own reasoning — web pages, MCP tool
-results — is wrapped before the model sees it:
+results, shell command output — is wrapped before the model sees it:
 
 ```
 <<<EXTERNAL_UNTRUSTED_CONTENT source="https://example.com">>>
@@ -461,6 +465,14 @@ slash commands included). Every turn serializes behind one global lock, so a
 single user sending in a loop starves everyone else in the queue. Rejected
 messages are not counted, so a user who keeps hammering still drains out of the
 window rather than being locked out permanently.
+
+**Per-platform allowlist scoping.** `slack_allowed_users`, `discord_allowed_users`,
+etc. are matched against the platform the message actually arrived on — an id
+listed under the wrong platform's line is treated as unlisted and denied by
+default (`strict_platform_allowlist=1`). Set `strict_platform_allowlist=0` only
+as a temporary migration aid: it downgrades a cross-platform match to a grace
+allow with a one-time warning naming the correct config line, rather than a
+silent bypass. Full detail in [Messaging Gateway](08-messaging-gateway.md#ids-are-scoped-to-their-platform).
 
 ### Recommended hardened gateway profile
 

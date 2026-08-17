@@ -107,10 +107,10 @@ that get merged into the agent's context.
 | Skill | Category |
 |---|---|
 | `plan` | workflow |
-| `systematic-debugging` | workflow |
-| `test-driven-development` | workflow |
-| `github-code-review` | workflow |
-| `documentation-writing` | workflow |
+| `systematic-debugging` | software-development |
+| `test-driven-development` | software-development |
+| `github-code-review` | software-development |
+| `documentation-writing` | productivity |
 
 Loaded skills appear in the system prompt under `## Installed skills`, and in
 `/status`.

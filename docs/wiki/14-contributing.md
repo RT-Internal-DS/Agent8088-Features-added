@@ -28,6 +28,12 @@ developer's **real** `~/.agent8088/config.txt`. It happened.
 HOME="$(mktemp -d)" AGENT8088_CONFIG=/nonexistent python -m agent8088.cli --help
 ```
 
+`.claude/hooks/guard-agent8088-cli.sh` mechanically blocks a bare
+`agent8088`/`python -m agent8088` invocation from the Bash tool that's missing
+an isolated `HOME`/`AGENT8088_CONFIG`/`AGENT8088_HOME` — but that's a backstop
+for this session's tooling, not a substitute for isolating it yourself, and it
+only fires once the file-watcher has picked up `.claude/settings.json`.
+
 ### 2. Always set `AGENT8088_CONFIG=/nonexistent` in tests
 
 Forces packaged defaults so tests never read or write real config.
@@ -88,6 +94,11 @@ history has a repro that failed before and passed after.
   *why it's unresolved* — and prefer actually resolving it.
 - **Prefer real behaviour over mocks** for verification scripts, and report
   unavailable dependencies as explicit skips, never silent passes.
+
+A `PostToolUse` hook (`.claude/hooks/run-tests-on-edit.sh`) auto-runs the unit
+suite after edits to `src/agent8088/**/*.py` in this session, as a fast
+first-pass safety net — it doesn't replace running the full suite yourself
+before opening a PR.
 
 ## Before opening a PR
 

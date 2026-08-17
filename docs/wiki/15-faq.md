@@ -125,6 +125,16 @@ Resolution order is `.env` key store → explicit `api_key` in `config.txt` →
 export cannot silently redirect a configured provider. See
 [Resolution order](02-configuration.md#resolution-order).
 
+### Why isn't memory recalling anything?
+
+Run `/memory test` — it shows whether the fact-extraction model is actually
+producing usable JSON. A model that can't often stores nothing and says
+nothing, which looks identical to "there was nothing worth remembering." If
+`/memory search` shows a `—` in the Meaning column for every result, the
+embedder isn't answering and you're getting keyword-only recall — check
+`memory_embed_provider` / `memory_embed_model` are pointed at something
+reachable. See [Memory § When memory seems to be learning nothing](16-memory.md#when-memory-seems-to-be-learning-nothing).
+
 ## Safety
 
 ### Can a web page or an MCP server give my agent instructions?
@@ -157,3 +167,13 @@ any configuration. See [MCP server mode](07-mcp.md#server-mode).
 `cron_mode=deny` (the default) refuses the gated action and tells the model to
 report it. `cron_mode=approve` treats the gate as granted. Neither unlocks the
 always-on floor. See [Unattended runs](03-permissions-and-security.md#unattended-runs).
+
+### Could a poisoned web page or message plant a fake memory that escalates privilege?
+
+No — a memory is a note about you, never an instruction, and four independent
+properties enforce that: only genuine user turns (never tool output like web
+pages or shell results) can become a memory or trigger a recall, the recalled
+block is labelled as data and states outright that it cannot authorize a tool
+call, and `check_permission()` never reads memories at all — there is no code
+path from a stored fact to a permission decision. See
+[Memory § Security](16-memory.md#security).

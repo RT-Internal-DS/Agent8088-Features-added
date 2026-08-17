@@ -36,7 +36,7 @@ Run with no flags for the interactive REPL.
 
 ## Slash commands
 
-**36 registered commands.** Prefix-matched, so `/mo` offers `/mode`, `/model`,
+**37 registered commands.** Prefix-matched, so `/mo` offers `/mode`, `/model`,
 `/models`.
 
 ### Session
@@ -53,7 +53,8 @@ Run with no flags for the interactive REPL.
 | `/compact [n]` | Summarise older turns, keep the last `n` verbatim |
 | `/save <file>` | Export conversation + trace to JSON (mode `0600`) |
 | `/status` | Model, mode, tools, skills, token usage |
-| `/usage` | Token usage for this session |
+| `/usage [off\|tokens\|full]` | Show token usage for this session, or change how much detail is shown per turn |
+| `/memory [on\|off\|search\|add\|forget\|notify\|test\|clear]` | Show or change persistent memory: toggle it, search/add/forget stored facts, change notification verbosity, run a diagnostic, or clear the store. See [Memory](16-memory.md) |
 | `/exit` | Quit |
 
 ### Model
@@ -66,7 +67,7 @@ Run with no flags for the interactive REPL.
 | `/temp <float>` | Sampling temperature |
 | `/maxturns <int>` | Max agent turns per prompt (same as `/limits max_turns`) |
 | `/reasoning` | Toggle reasoning display |
-| `/think` | Extended thinking mode |
+| `/think [on\|off]` | Alias for `/reasoning` — same toggle, not a distinct thinking mode |
 | `/raw <text>` | One raw model call — content, reasoning, tool_calls |
 
 ### Tools and execution
@@ -81,7 +82,7 @@ Run with no flags for the interactive REPL.
 | `/image <path>` | Attach an image to the next prompt |
 | `/agents` | List sub-agent profiles |
 | `/agent <type> <task>` | Run a sub-agent directly |
-| `/skills` | List skills; `disable`/`enable <name>` |
+| `/skills` | List skills; `disable`/`enable <name>`; `/skills <name>` shows that skill's playbook prose |
 
 ### Permissions and isolation
 
@@ -89,7 +90,7 @@ Run with no flags for the interactive REPL.
 |---|---|
 | `/mode [readonly\|full-auto]` | Show or switch permission mode. Use `/plan` to enter plan mode |
 | `/reset`, `/clear` | Discard the conversation — asks first unless `destructive_slash_confirm=0` |
-| `/sandbox [auto\|native\|docker\|local\|setup]` | Show, select or install isolation |
+| `/sandbox [auto\|native\|docker\|setup]` | Show, select or install isolation. Only `auto`, `native`, or `docker` are valid backends — there is no `local`. |
 | `/search [status\|setup\|stop\|doctor\|use <backend>]` | Show, provision, or pin a web search backend |
 
 ### MCP
@@ -114,7 +115,8 @@ Run with no flags for the interactive REPL.
 | `/capabilities` | What the agent can do and which guardrails are in force |
 | `/doctor` | Environment health check |
 | `/trace [on\|off]` | Toggle JSON trace capture |
-| `/verbose` | Toggle verbose output |
+| `/trace save [path]` | Export the full conversation trace to a file, independent of the on/off toggle |
+| `/verbose [on\|off\|full]` | Cycle verbose output; `full` also turns on trace capture |
 
 ## Gateway commands
 
@@ -128,6 +130,8 @@ Inside Slack / WhatsApp / Discord / Telegram / Email:
 | `/capabilities` | Tools, MCP servers, skills, limits, active guardrails |
 | `/approve` | Approve the pending action (add `session` to hold for the session) |
 | `/deny` | Refuse it |
+| `/mode [readonly\|full-auto]` | Show or set the permission mode for this chat |
+| `/plan [task]` | Enter plan mode and, optionally, propose a plan for the given task |
 
 Discord also offers ✅ / ❌ buttons with a fail-closed timeout.
 

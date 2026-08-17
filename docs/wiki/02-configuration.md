@@ -54,10 +54,10 @@ setting — `/temp`). Details in [Model Providers](05-model-providers.md).
 | `deny_commands` | (empty) | Shell commands to refuse (fnmatch globs). Refused in every mode. |
 | `allow_commands` | (empty) | If set, the **only** shell commands permitted (fnmatch globs). `deny_commands` still wins, and no allowlist re-enables the unrecoverable floor. |
 | `readonly_safe_commands` | (built-in list) | Commands treated as safe inspection in readonly mode. |
-| `ssrf_allow_hosts` | `127.0.0.1,localhost,192.168.3.67:8888` | Temporary LAN deployment allowlist for the shared SearXNG; replace before public distribution. |
-| `web_search_provider` | `searxng` | Temporary LAN deployment pin; replace before public distribution. |
-| `web_search_no_prompt` | `1` | Temporary LAN no-prompt opt-in; only pinned, allowlisted private SearXNG is permitted. |
-| `search_base_url` | `http://192.168.3.67:8888/search?q=` | Temporary LAN SearXNG endpoint; replace before public distribution. `https://` is required for public hosts. |
+| `ssrf_allow_hosts` | `127.0.0.1,localhost,192.168.3.67:8888` | Example LAN allowlist shipped in the packaged config; replace the `192.168.3.67:8888` entry with your own SearXNG host, or drop it if you're using the default loopback setup from `/search setup`. |
+| `web_search_provider` | `auto` | `auto` probes at startup and pins the best available backend (keyed tavily/exa first, else a live SearXNG, else ddgs) for the rest of the session. Set to a specific name (`searxng`, `ddgs`, `tavily`, `exa`) to pin one with no fallback, or leave unset to fall through the whole chain per call. See [Web search](04-tools.md#web-search-backends) and the `/search` command below. |
+| `web_search_no_prompt` | `1` | Skips the approval prompt for a search, but **only** while `auto` has pinned a loopback or explicitly allowlisted private-LAN SearXNG — it never applies to a fallback that could reach a public provider. |
+| `search_base_url` | `http://192.168.3.67:8888/search?q=` | SearXNG query endpoint. The packaged default points at an example LAN box — replace it with `http://127.0.0.1:8888/search?q=` (the address `/search setup` provisions) or your own instance. A remote host must use `https://`; plaintext `http://` is only accepted for loopback/private hosts, and the host must be present in `ssrf_allow_hosts` or requests to it are blocked as internal. See [Self-hosting SearXNG](04-tools.md#self-hosting-searxng-locally). |
 | `search_date_augmentation` | `1` | Append the current year (or month, for "today"/"this week" questions) to a search query that means "as of now" and names no year of its own. Set `0` to send queries exactly as the model wrote them. |
 | `web_search_results` | `5` | Results per search (max 20). |
 | `ssrf_allow_private` | `0` | `1` opens the entire private network. Prefer the allowlist. |
@@ -97,6 +97,14 @@ Scheduled runs created by `schedule_task` set `AGENT8088_UNATTENDED=1` themselve
 so `cron_mode` applies without extra setup. The variable is read once at startup,
 not per call.
 
+### Plan step auditing
+
+| Key | Default | Purpose |
+|---|---|---|
+| `plan_audit` | `0` | `1` verifies every mutating `execute_plan` step against the real environment with the readonly `auditor` sub-agent before the plan moves on; a failed verification halts the plan. Costs one extra model call per mutating step, drawn from the same turn budget as the work itself. Worth enabling for unattended runs (gateway, cron) where no operator is watching. |
+| `plan_audit_revert` | `1` | With auditing on, a step that fails verification is restored to its exact pre-step bytes — only verified state persists. Tools with no undo (shell, docker, cron) say so rather than implying a rollback that did not happen. |
+| `plan_audit_revert_max_bytes` | `1048576` | Files larger than this are not snapshotted, so they are not reverted — the plan output says so rather than implying otherwise. |
+
 ## Sandbox
 
 | Key | Default | Purpose |
@@ -105,6 +113,7 @@ not per call.
 | `sandbox_runtime_version` | pinned | Version of the native runtime to install. |
 | `sandbox_allowed_domains` | (empty) | Domains reachable from inside the sandbox. |
 | `docker_image` / `docker_network` | | Docker fallback settings. |
+| `docker_pull_seconds` | `300` | Seconds allowed for pulling a missing container image. Kept separate from a tool's own timeout so a first-run image pull doesn't fail as an unexplained timeout under a short-timeout tool like the read-only git tools. |
 
 ## Gateway
 
