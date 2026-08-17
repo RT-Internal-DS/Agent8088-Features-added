@@ -75,8 +75,8 @@
 | 4.6 | After 4.1 completes, immediately ask `delete /tmp/hello_again.txt too` | Type `y` again | Prompts y/n **again** — one-shot grant reverted after 4.1 | Revert to readonly |
 | 4.7 | `read tools.txt` | — | `read_text` always allowed in readonly | Read-only allowed modes |
 | 4.8 | `calculate 2^10` | — | `calculate` always allowed in readonly | Read-only allowed modes |
-| 4.9 | Run `agent8088 --edit` then `delete /tmp/hello.txt` | — | No escalation — edit mode from start | `--edit` flag |
-| 4.10 | Run `AGENT8088_PERMISSION=edit agent8088`, then enter `delete /tmp/hello.txt` | — | No permission prompt | Env var override |
+| 4.9 | Run `agent8088 --full-auto` then `delete /tmp/hello.txt` | — | No escalation — full-auto mode from start | `--full-auto` flag |
+| 4.10 | Run `AGENT8088_PERMISSION=full-auto agent8088`, then enter `delete /tmp/hello.txt` | — | No permission prompt | Env var override |
 
 ---
 
@@ -177,8 +177,8 @@ Run these inside `agent8088`:
 |---|---|---|---|
 | 11.1 | Start `agent8088` (readonly). Ask `create a folder ./test_perm`. | Escalation panel (yellow, rounded). Type `y`. Model receives "Permission granted. Retry the tool call that was blocked." Retries `mkdir` → succeeds. | Full escalation cycle |
 | 11.2 | Same as 11.1 but type **`n`** | "Permission denied — staying in readonly mode." Model tells you the task can't be completed. Does not retry. | Denial path |
-| 11.3 | Start `agent8088 --edit`. Ask `create a folder ./test_perm2`. | No escalation — edit mode from start. | `--edit` flag |
-| 11.4 | Start `AGENT8088_PERMISSION=edit agent8088`, then enter `list files` | Edit mode, no prompts | Env var override |
+| 11.3 | Start `agent8088 --full-auto`. Ask `create a folder ./test_perm2`. | No escalation — full-auto mode from start. | `--full-auto` flag |
+| 11.4 | Start `AGENT8088_PERMISSION=full-auto agent8088`, then enter `list files` | Full-auto mode, no prompts | Env var override |
 
 ---
 
