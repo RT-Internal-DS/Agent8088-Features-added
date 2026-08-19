@@ -6566,7 +6566,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         content = _strip_reasoning(message.content or "")
         native_text = _native_tool_text(message)
         if native_text:
-            content = "\n".join(part for part in (content, native_text) if part)
+            # message.content may already contain the model's own (often malformed)
+            # ✿FUNCTION✿ markup alongside the structured tool_calls; keep only the
+            # canonical reconstruction so the stored turn has one parseable copy.
+            content = "\n".join(part for part in (strip_tool_json(content), native_text) if part)
         messages.append({"role": "assistant", "content": content})
 
         calls = find_tool_calls(content, round_allowed_tools)
