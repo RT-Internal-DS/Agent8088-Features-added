@@ -680,10 +680,7 @@ from agent8088 import cli  # noqa: E402
 def test_dump_redacts_a_configured_secret(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.A, "APP_DIR", tmp_path)
     monkeypatch.setattr(cli.A, "APP_CONFIG", {"provider.openai.api_key": "sk-super-secret-value"})
-    monkeypatch.setattr(cli.A, "collect_secret_values",
-                         lambda config: cli.A.collect_secret_values.__wrapped__(config)
-                         if hasattr(cli.A.collect_secret_values, "__wrapped__")
-                         else ["sk-super-secret-value"])
+    monkeypatch.setattr(cli.A, "collect_secret_values", lambda config: ["sk-super-secret-value"])
 
     cli.cmd_dump("")
 
