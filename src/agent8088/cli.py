@@ -4660,7 +4660,7 @@ def _run_uninstall():
 
 # The branch releases come from. Change this one line when that moves; the
 # resolver below copes with it having been renamed or retired in the meantime.
-UPDATE_BRANCH = "development"
+UPDATE_BRANCH = "staging"
 
 
 def _git(install_dir, *args):

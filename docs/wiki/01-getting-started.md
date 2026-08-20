@@ -16,13 +16,13 @@ No admin rights are needed for the base install.
 **macOS / Linux / WSL2**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/tayyabimam1/Agent8088-Features-added/main/install.sh | bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/RT-Internal-DS/Agent8088-Features-added/staging/install.sh | AGENT8088_BRANCH=staging bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-iex (irm https://raw.githubusercontent.com/tayyabimam1/Agent8088-Features-added/main/install.ps1)
+$env:AGENT8088_BRANCH = "staging"; iex (irm https://raw.githubusercontent.com/RT-Internal-DS/Agent8088-Features-added/staging/install.ps1)
 ```
 
 The installer installs [uv](https://docs.astral.sh/uv/) if missing, clones the
@@ -32,7 +32,7 @@ default `config.txt` pointing at localhost Ollama.
 **From a clone, for development:**
 
 ```sh
-git clone https://github.com/tayyabimam1/Agent8088-Features-added.git
+git clone --branch development https://github.com/RT-Internal-DS/Agent8088-Features-added.git
 cd Agent8088-Features-added
 python -m venv .venv
 .venv/bin/pip install -e ".[gateway,dev]"

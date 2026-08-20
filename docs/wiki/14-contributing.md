@@ -5,7 +5,7 @@
 ## Setup
 
 ```sh
-git clone https://github.com/tayyabimam1/Agent8088-Features-added.git
+git clone --branch development https://github.com/RT-Internal-DS/Agent8088-Features-added.git
 cd Agent8088-Features-added
 python -m venv .venv
 .venv/bin/pip install -e ".[gateway,dev]"

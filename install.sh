@@ -169,8 +169,8 @@ fi
 # ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
-REPO_URL="https://github.com/tayyabimam1/Agent8088-Features-added.git"
-REPO_BRANCH="${AGENT8088_BRANCH:-main}"
+REPO_URL="https://github.com/RT-Internal-DS/Agent8088-Features-added.git"
+REPO_BRANCH="${AGENT8088_BRANCH:-staging}"
 AGENT8088_HOME="${AGENT8088_HOME:-$HOME/.agent8088}"
 INSTALL_DIR="$AGENT8088_HOME/agent8088"
 PYTHON_VERSION="3.11"
@@ -1438,7 +1438,7 @@ verify_install() {
         echo "  Sandbox:  Docker fallback is automatic when available"
         echo "            Native setup: agent8088 --sandbox-setup"
     fi
-    echo "  Update: AGENT8088_BRANCH=$BRANCH curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/tayyabimam1/Agent8088-Features-added/$BRANCH/install.sh | bash"
+    echo "  Update: AGENT8088_BRANCH=$BRANCH curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/RT-Internal-DS/Agent8088-Features-added/$BRANCH/install.sh | bash"
     echo ""
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
     # Last, so it is the final thing on screen: per-stage warnings scrolled out of

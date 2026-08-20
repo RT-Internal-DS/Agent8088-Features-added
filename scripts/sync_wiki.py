@@ -29,7 +29,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO = "tayyabimam1/Agent8088-Features-added"
+REPO = "RT-Internal-DS/Agent8088-Features-added"
 SOURCE_DIR = Path(__file__).resolve().parent.parent / "docs" / "wiki"
 
 # source filename -> wiki page name (no .md). Order defines the sidebar.
@@ -85,7 +85,7 @@ BANNER = (
 
 SOURCE_NOTE = (
     "\n\n---\n\n*Source of truth: [`docs/wiki/`](https://github.com/"
-    f"{REPO}/tree/development/docs/wiki) in the main repository. "
+    f"{REPO}/tree/staging/docs/wiki) in the main repository. "
     "Edits here are overwritten by the next sync.*\n"
 )
 
