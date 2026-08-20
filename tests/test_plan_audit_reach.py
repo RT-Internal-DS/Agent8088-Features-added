@@ -2,9 +2,16 @@
 
 The auditor used to reach a plan's writes for a structural reason rather than a
 deliberate one: plan mode forced everything through `execute_plan`, and that was
-the only path it hooked. Approved plans now run as ordinary tool calls, which
+the only path it hooked. Approved plans then ran as ordinary tool calls, which
 would have left the default `/plan` path as the one path with no verification at
 all — the opposite of the intent.
+
+The gate is now `PLAN_AUDIT and depth == 0`, with no plan in it. `/audit on`
+says every mutating step is checked, so scoping it to an approved plan made the
+setting mean something narrower than its own message — and left the ordinary
+full-auto prompt, the path a user reaches without typing `/plan`, unverified.
+Depth still bounds it: a sub-agent's writes are not the top-level work, and
+auditing inside the auditor would set it verifying itself.
 
 Also pinned here, against two claims that had been made about the auditor. Its
 browser scope is what the code always did and not what the claim said: a stated
@@ -84,14 +91,33 @@ def test_a_failed_verification_tells_the_model_to_stop(engine, tmp_path):
     assert "Stop" in out and "later step" in out
 
 
-def test_nothing_is_audited_before_a_plan_is_approved(engine, tmp_path):
+def test_ordinary_work_is_audited_when_audit_is_on(engine, tmp_path):
+    """`/audit on` is not scoped to plans.
+
+    A plain full-auto write is what the user hits without ever typing `/plan`,
+    and gating the audit on an approved plan left that — the common path — as
+    the one path with no verification at all, while the `/audit on` message
+    promised every mutating step would be checked.
+    """
     seen = _audit_on(engine, tmp_path)
     engine.PERMISSION_MODE = "full-auto"
 
     engine.exec_tool("write_file",
                      json.dumps({"filename": str(tmp_path / "free.txt"), "content": "x"}))
 
-    assert seen == [], "ordinary work outside a plan is not the auditor's business"
+    assert [s["agent_type"] for s in seen] == ["auditor"]
+
+
+def test_audit_off_leaves_ordinary_work_alone(engine, tmp_path):
+    """The other half of the toggle: off means off outside a plan too."""
+    seen = _audit_on(engine, tmp_path)
+    engine.PLAN_AUDIT = False
+    engine.PERMISSION_MODE = "full-auto"
+
+    engine.exec_tool("write_file",
+                     json.dumps({"filename": str(tmp_path / "out.txt"), "content": "x"}))
+
+    assert seen == []
 
 
 def test_a_subagents_writes_are_not_audited(engine, tmp_path):

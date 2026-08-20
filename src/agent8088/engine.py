@@ -293,9 +293,12 @@ PROJECT_ROOT = _configured_project_root(APP_CONFIG)
 ARTIFACTS_ROOT = (PROJECT_ROOT / "artifacts").resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Ends at "q=" with NO placeholder — tools.txt appends {query_q} itself. (A trailing
-# {query} here would produce a doubled placeholder in the final URL.)
-SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "http://127.0.0.1:8888/search?q=")
+# Unset unless the operator configured one. A loopback default used to live here
+# for tools.txt to interpolate, but web_search is mode=search now and never
+# templates a URL — so the default only made every machine claim a SearXNG it
+# did not have, costing a failed local request before the fallback took over.
+# Ends at "q=" with NO placeholder; the SearXNG backend appends the query.
+SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "")
 # Whether the user actually SET a search URL, captured before the default is
 # injected into APP_CONFIG below. The web search registry needs the distinction:
 # a defaulted value would make the SearXNG backend claim to be configured on
@@ -498,7 +501,23 @@ MCP_RELOAD_CONFIRM = APP_CONFIG.get("mcp_reload_confirm", "1") != "0"
 SANDBOX_BACKEND = os.environ.get(
     "AGENT8088_SANDBOX", APP_CONFIG.get("sandbox_backend", "auto")
 ).strip().lower()
-SANDBOX_RUNTIME_VERSION = APP_CONFIG.get("sandbox_runtime_version", "0.0.67")
+_SANDBOX_RUNTIME_DEFAULT = "0.0.73"
+
+
+def _sandbox_runtime_version(config: dict) -> str:
+    """Upgrade the one Windows runtime version Agent8088 previously shipped.
+
+    0.0.67 kept the shared sandbox account credential in each installing user's
+    profile. Elevating as another administrator or rotating the account from a
+    second user stranded the credential and made CreateProcessWithLogonW fail.
+    0.0.73 moved install state to a machine-wide store. Preserve any deliberate
+    custom pin; only migrate Agent8088's former default.
+    """
+    configured = str(config.get("sandbox_runtime_version", "")).strip()
+    return _SANDBOX_RUNTIME_DEFAULT if configured in ("", "0.0.67") else configured
+
+
+SANDBOX_RUNTIME_VERSION = _sandbox_runtime_version(APP_CONFIG)
 SANDBOX_ALLOWED_DOMAINS = [
     value.strip()
     for value in APP_CONFIG.get("sandbox_allowed_domains", "").split(",")
@@ -507,8 +526,14 @@ SANDBOX_ALLOWED_DOMAINS = [
 
 # Tool templates interpolate from APP_CONFIG, so any default that a tool URL or
 # command references must exist there too. Without this, a missing config key left
-# `{search_base_url}` literal in the URL and web_search failed with the confusing
+# a `{placeholder}` literal in the URL and the tool failed with the confusing
 # "Blocked: scheme '' is not allowed" from the SSRF guard.
+#
+# search_base_url seeds an EMPTY string, not an endpoint: it is no longer
+# templated (web_search is mode=search), and both the SearXNG backend's
+# is_available() and _local_searxng_no_prompt_enabled() read "" as "operator
+# chose nothing" — which is what keeps a machine with no instance out of the
+# no-prompt path.
 APP_CONFIG.setdefault("search_base_url", SEARCH_BASE_URL)
 APP_CONFIG.setdefault("gemma_base_url", GEMMA_BASE_URL)
 APP_CONFIG.setdefault("model_base_url", MODEL_BASE_URL)
@@ -659,6 +684,15 @@ def reset_turn_approval_state() -> None:
     global _one_shot_grant, _local_fallback_grant, _remote_git_grant, _pending_approval_key
     _one_shot_grant = _local_fallback_grant = _remote_git_grant = False
     _pending_approval_key = ""
+
+
+def _take_search_fallback_grant(approval_key: str) -> bool:
+    """Spend the exact approval that permits a local search to use DDGS."""
+    global _one_shot_grant
+    if _one_shot_grant != approval_key:
+        return False
+    _one_shot_grant = False
+    return True
 
 
 def _tool_call_key(name: str, args: dict) -> str:
@@ -1606,8 +1640,10 @@ def _retryable_model_error(error: Exception) -> bool:
 
 
 def _create_completion_with_fallback(messages, tools, *, temperature, system_prompt,
-                                     on_token, interrupt_check, trace, turn):
+                                     on_token, interrupt_check, trace, turn,
+                                     max_tokens=None):
     emitted = False
+    max_tokens = max_tokens if max_tokens is not None else MAX_COMPLETION_TOKENS
 
     def tracked_token(kind, delta):
         nonlocal emitted
@@ -1619,7 +1655,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
     try:
         return create_completion(
             client, messages, tools, temperature=temperature,
-            max_tokens=MAX_COMPLETION_TOKENS,
+            max_tokens=max_tokens,
             system_prompt=system_prompt, on_token=token_handler,
             interrupt_check=interrupt_check,
             provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
@@ -1646,7 +1682,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 })
             return create_completion(
                 fallback_client, messages, tools, temperature=temperature,
-                max_tokens=MAX_COMPLETION_TOKENS,
+                max_tokens=max_tokens,
                 system_prompt=system_prompt, on_token=token_handler,
                 interrupt_check=interrupt_check, model_name=model_name,
                 provider_name=provider_name, telemetry_attempt="fallback",
@@ -1901,25 +1937,41 @@ def _resolve_tool_name(name):
 RUNTIME_CONTEXT_HEADING = "\n\n## Runtime Context\n"
 
 
-def render_runtime_context(now=None) -> str:
-    """Tell the model what day it is.
+def render_runtime_context(now=None, channel: str = "", chat_type: str = "") -> str:
+    """Tell the model what day it is, and which model/channel it's running as.
 
-    Without this it has no clock — only a training cutoff — so "the next
-    election" silently means whatever was next while it was trained, and a
-    page from years ago reads as current. Every date-aware behaviour in the
+    Without the date block it has no clock — only a training cutoff — so "the
+    next election" silently means whatever was next while it was trained, and
+    a page from years ago reads as current. Every date-aware behaviour in the
     search path depends on this block being present.
 
     Rendered per turn rather than at import: a gateway or cron process runs
-    for days and would otherwise keep answering with the date it booted on.
+    for days and would otherwise keep answering with the date it booted on,
+    the model it booted with (after a live /model switch), and no channel.
+
+    `channel`/`chat_type` are supplied by the gateway (platform + whether the
+    message is a direct message or a group/channel one) and left blank for
+    the CLI, which has no such notion.
     """
     moment = now or datetime.now().astimezone()
-    return (
+    model_line = f"- You are Agent8088, currently running on model `{MODEL_NAME}`"
+    if ACTIVE_PROVIDER:
+        model_line += f" via the `{ACTIVE_PROVIDER}` provider"
+    model_line += (". If asked what model or provider is powering you, answer plainly "
+                    "and accurately from this line — it is not confidential.\n")
+    lines = [
         f"{RUNTIME_CONTEXT_HEADING}"
         f"- Today is {moment.strftime('%A, %d %B %Y')}.\n"
         f"- Current year: {moment.year}. Current month: {moment.strftime('%B %Y')}.\n"
         "- Your training data is older than today. For anything current, "
-        "time-sensitive, or scheduled, search rather than answering from memory.\n"
-    )
+        "time-sensitive, or scheduled, search rather than answering from memory.\n",
+        model_line,
+    ]
+    if channel:
+        kind = "a direct message" if chat_type == "private" else "a group/channel"
+        lines.append(f"- You are replying over the messaging gateway, on {channel}, in "
+                      f"{kind}. Keep formatting light here — see Messaging Gateway below.\n")
+    return "".join(lines)
 
 
 def current_system_prompt() -> str:
@@ -2652,19 +2704,15 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
     return "", ""
 
 
-def _approved_plan_audit_applies(tool_name: str, depth: int) -> bool:
+def _audit_applies(tool_name: str, depth: int) -> bool:
     """Whether an ordinary tool call should be verified right now.
 
-    The auditor reached a plan's writes for a structural reason rather than a
-    deliberate one: plan mode forced every mutation through `execute_plan`, and
-    that is the only path the audit hooked. An approved plan now runs as ordinary
-    tool calls, so without this the default `/plan` path would be the one path
-    with no verification at all — the opposite of what the audit is for.
-
-    Depth 0 only. A sub-agent's writes are not the plan, and auditing inside the
-    auditor would set it verifying itself.
+    `/audit on` means every mutating step gets checked, plan or no plan — it
+    is not scoped to an approved `/plan` session. Depth 0 only: a sub-agent's
+    writes are not the top-level work, and auditing inside the auditor would
+    set it verifying itself.
     """
-    if not (PLAN_AUDIT and _plan_approved and depth == 0):
+    if not (PLAN_AUDIT and depth == 0):
         return False
     return _plan_step_is_auditable(tool_name, "")
 
@@ -3238,10 +3286,24 @@ GIT_DOCKER_IMAGE = "alpine/git:v2.47.2"
 DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none")
 _DOCKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
 _SANDBOX_BACKENDS = frozenset(("auto", "native", "docker"))
-# Set after a native pre-flight failure. The restricted account or OS policy
-# does not heal during the process, so both execution and status use Docker for
-# the rest of the session when it is available.
+# Native availability has two stages: binaries on PATH, then one real no-op
+# execution. A restricted account, locked-down kernel, or container can pass the
+# first check but fail the second for the whole process lifetime.
 _native_sandbox_broken = False
+_native_sandbox_verified = None
+_native_sandbox_failure = ""
+_NATIVE_SANDBOX_PROBE_TIMEOUT = 10
+# Docker gets the same two stages, for the same reason. `docker info` succeeding
+# does not mean the daemon can bind-mount our workspace: when Agent8088 itself
+# runs in a container the daemon resolves that path against the *host*, so the
+# mount fails unless the workspace sits at the same absolute path on both sides.
+# Presence was previously assumed from `docker info` alone, and later assumed
+# absent from /.dockerenv alone — both guesses, and both wrong in one direction.
+_docker_sandbox_broken = False
+_docker_sandbox_verified = None
+_docker_sandbox_failure = ""
+_docker_workspace_verified = {}
+_DOCKER_SANDBOX_PROBE_TIMEOUT = 30
 
 
 def _which_executable(name: str) -> str | None:
@@ -3268,6 +3330,26 @@ def _agent_data_dir() -> Path:
     return Path.home() / ".agent8088"
 
 
+_DSH_SANDBOX_ACL_VERSION = "0.1.0-rc.7"  # pin exact - pre-1.0 package, no ranges
+
+
+def _native_sandbox_shell_argv(command: str) -> list:
+    """Wrap a shell command string for cmd.exe.
+
+    The Windows ACL runner execs argv directly and has no shell semantics of
+    its own (no &&, no VAR=value env-prefix syntax) - cmd.exe does the
+    interpreting instead of the runner.
+    """
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    cmd_exe = str(Path(system_root) / "System32" / "cmd.exe")
+    return [cmd_exe, "/d", "/s", "/c", command]
+
+
+def _dsh_runner_path() -> Path:
+    return (_agent_data_dir() / "runtime" / "node_modules" / "@deepseek-ai"
+            / "dsh-sandbox-windows-acl" / "lib" / "runner.js")
+
+
 def _native_sandbox_argv():
     override = os.environ.get("AGENT8088_SRT")
     if override:
@@ -3276,6 +3358,12 @@ def _native_sandbox_argv():
             argv = [part[1:-1] if len(part) > 1 and part[0] == part[-1] == '"'
                     else part for part in argv]
         return argv
+    if sys.platform == "win32":
+        node = _which_executable("node")
+        runner = _dsh_runner_path()
+        if not node or not runner.exists():
+            return None
+        return [node, str(runner)]
     cli = (_agent_data_dir() / "runtime" / "node_modules"
            / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js")
     node = _which_executable("node")
@@ -3292,6 +3380,12 @@ def _native_sandbox_missing_requirements() -> list:
         required = ("sandbox-exec", "rg")
     elif sys.platform.startswith("linux"):
         required = ("bwrap", "socat", "rg")
+    elif sys.platform == "win32":
+        missing = []
+        koffi_dir = _agent_data_dir() / "runtime" / "node_modules" / "koffi"
+        if not koffi_dir.is_dir():
+            missing.append("koffi native addon")
+        return missing
     else:
         required = ()
     return [command for command in required if not shutil.which(command)]
@@ -3309,20 +3403,30 @@ def _docker_available() -> bool:
         return False
 
 
+def _docker_usable() -> bool:
+    """Docker is installed, reachable, and has not failed a real sandbox run.
+
+    Separate from `_docker_available` so a latched mount or daemon failure takes
+    Docker out of the running everywhere at once, the way `_native_sandbox_broken`
+    does for native. Otherwise status keeps offering a backend that cannot run.
+    """
+    return not _docker_sandbox_broken and _docker_available()
+
+
 def _resolve_sandbox_backend() -> str:
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
     native_available = not _native_sandbox_missing_requirements()
     if requested == "native":
-        if native_available and _native_sandbox_broken and _docker_available():
-            return "docker"
+        if native_available and _native_sandbox_broken:
+            return "docker" if _docker_usable() else "unavailable"
         return "native" if native_available else "unavailable"
     if requested == "docker":
-        return "docker" if _docker_available() else "unavailable"
+        return "docker" if _docker_usable() else "unavailable"
     if native_available:
-        if _native_sandbox_broken and _docker_available():
-            return "docker"
+        if _native_sandbox_broken:
+            return "docker" if _docker_usable() else "unavailable"
         return "native"
-    return "docker" if _docker_available() else "unavailable"
+    return "docker" if _docker_usable() else "unavailable"
 
 
 def sandbox_status() -> dict:
@@ -3335,12 +3439,50 @@ def sandbox_status() -> dict:
     missing = _native_sandbox_missing_requirements()
     if resolved == "unavailable" and missing:
         detail += f" (missing: {', '.join(missing)})"
+    elif resolved == "unavailable" and _docker_sandbox_broken:
+        # "unavailable" with nothing missing reads as unexplained. Docker being
+        # installed and running but unable to mount the workspace is the case
+        # that most needs naming, because nothing looks wrong from outside.
+        detail += f" — {_docker_sandbox_repair_hint(_docker_sandbox_failure)}"
+    # Report on the backend that would actually run, not always on native. A
+    # docker-backed session showing native's verdict read as "docker
+    # (unverified)", which says nothing about docker and is wrong wherever
+    # docker is the one that cannot run.
+    if resolved == "docker":
+        if _docker_sandbox_broken:
+            verification = "failed"
+        elif _docker_sandbox_verified:
+            verification = "verified"
+        else:
+            verification = "unverified"
+        failure = _docker_sandbox_failure
+        # `verification` now describes docker, so why we are on docker at all has
+        # to be said somewhere or it is lost: native is the preferred backend and
+        # its failure is the more interesting half of the answer.
+        if _native_sandbox_broken:
+            detail += " (native failed verification)"
+    else:
+        if _native_sandbox_broken:
+            verification = "failed"
+        elif missing:
+            verification = "unavailable"
+        elif _native_sandbox_verified:
+            verification = "verified"
+        else:
+            verification = "unverified"
+        failure = _native_sandbox_failure
+    if resolved in ("native", "docker") and verification == "unverified":
+        detail += " (candidate; not yet verified by a sandboxed command)"
+    if resolved == "unavailable" and (_native_sandbox_failure or _docker_sandbox_failure):
+        failure = _native_sandbox_failure or _docker_sandbox_failure
     return {
         "requested": SANDBOX_BACKEND,
         "resolved": resolved,
         "detail": detail,
         "network": ", ".join(SANDBOX_ALLOWED_DOMAINS) or "blocked",
         "runtime_version": SANDBOX_RUNTIME_VERSION,
+        "verification": verification,
+        "failure": (failure or "")[:300],
     }
 
 
@@ -3415,26 +3557,51 @@ _NATIVE_SANDBOX_PREFLIGHT_ERRORS = (
     "CreateProcessWithLogonW",
     "Secondary Logon service",
     "srt-win: error:",
+    "windows-acl-run:",
+    "bwrap: No permissions to create new namespace",
+    "bwrap: Creating new namespace failed",
+    "bwrap: Can't mount proc",
+    "apply-seccomp:",
+    "sandbox-exec: sandbox_init:",
+    "sandbox-exec: sandbox_apply:",
 )
 
 
-def _native_sandbox_repair_hint(result: str) -> str:
-    """Turn the runtime's pre-flight error into something the reader can act on.
+def _native_sandbox_repair_hint(result: str, include_reason: bool = True) -> str:
+    """State what the runtime reported, then what is worth checking.
 
-    Raw, it is 200 characters of WFP and CreateProcessWithLogonW detail whose own
-    suggestion — start the Secondary Logon service — is usually wrong: the
-    service is running and the sandbox account is enabled, but the credential the
-    runtime holds no longer opens it. Reprovisioning is what actually fixes that,
-    and it needs elevation, which is the part worth saying out loud.
+    The wording this replaces named reprovisioning, antivirus and seclogon as the
+    causes, and returned them *instead of* the runtime's error. Traced on one
+    machine: the account was provisioned and enabled, seclogon was running, the
+    terminal was elevated, the antivirus had been uninstalled and the runtime
+    upgraded past the release that moved install state machine-wide — and the
+    message went on asserting all of them while the only string that identified
+    the failure was discarded. A confident wrong answer is worse than the raw
+    text it displaced.
+
+    So the reason leads, and what follows is explicitly a list of things to check
+    rather than a diagnosis. The logon branch also says outright that a
+    provisioned account plus a refused spawn is a sandbox-runtime problem rather
+    than the reader's configuration, because without that the reader keeps
+    re-running setup steps that cannot help.
+
+    `include_reason=False` is for `_sandbox_required_error`, whose text reaches
+    the model as a tool result: raw runtime stderr there reads as command output.
     """
-    text = result or ""
-    if "CreateProcessWithLogonW" in text or "Access is denied" in text:
-        return ("The sandbox account could not be logged into. Re-run "
-                "`agent8088 --sandbox-setup` from an elevated terminal to "
-                "reprovision it.")
+    text = (result or "").strip()
     if "Native sandbox runtime is unavailable" in text:
         return "The runtime is not installed. Run `agent8088 --sandbox-setup`."
-    return f"Reason: {text[:200]}"
+    checks = ""
+    if "windows-acl-run:" in text:
+        checks = ("The Windows ACL sandbox runner refused to start. Run "
+                  "`agent8088 --sandbox-setup` to reinstall it.")
+    elif "CreateProcessWithLogonW" in text or "Access is denied" in text:
+        checks = ("Windows refused the spawn. Run `agent8088 --sandbox-setup` "
+                  "to reinstall the native sandbox.")
+    if not include_reason:
+        return checks or "The native sandbox could not start."
+    reason = f"Reason: {text[:200]}" if text else "Reason: not reported."
+    return f"{reason} {checks}" if checks else reason
 
 
 def _native_sandbox_unusable(result: str) -> bool:
@@ -3448,19 +3615,243 @@ def _native_sandbox_unusable(result: str) -> bool:
     return any(marker in (result or "") for marker in _NATIVE_SANDBOX_PREFLIGHT_ERRORS)
 
 
+def _mark_native_sandbox_broken(result: str, quiet: bool = False) -> None:
+    """Latch a runtime failure and retain only a local diagnostic.
+
+    `quiet` is for callers that return the same failure to the reader
+    themselves, so one command does not report it twice.
+    """
+    global _native_sandbox_broken, _native_sandbox_verified, _native_sandbox_failure
+    first_failure = not _native_sandbox_broken
+    _native_sandbox_broken = True
+    _native_sandbox_verified = False
+    _native_sandbox_failure = result or "Native sandbox probe failed."
+    if first_failure and not quiet:
+        # The reason only. `install_native_sandbox` returns the guidance, and one
+        # `--sandbox-setup` run used to print the identical paragraph twice.
+        _log.warning("native sandbox could not start. Reason: %s",
+                     _native_sandbox_failure[:200])
+
+
+def _native_sandbox_ready(cwd: Path, readonly: bool = False,
+                          quiet: bool = False) -> bool:
+    """Run one real native no-op before trusting presence checks.
+
+    `quiet` suppresses the latch warning for a caller that reports the failure
+    in its own return value.
+    """
+    global _native_sandbox_verified
+    if _native_sandbox_broken:
+        return False
+    if _native_sandbox_verified is not None:
+        return bool(_native_sandbox_verified)
+
+    runtime = _native_sandbox_argv()
+    if not runtime:
+        _mark_native_sandbox_broken("Native sandbox runtime is unavailable.", quiet)
+        return False
+    try:
+        cwd = cwd.resolve()
+        cwd.mkdir(parents=True, exist_ok=True)
+        settings = _write_sandbox_settings(readonly, cwd)
+        sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
+    except OSError as exc:
+        _mark_native_sandbox_broken(f"Native sandbox probe could not prepare: {exc}", quiet)
+        return False
+    probe = _process_display([sys.executable, "-c", "pass"])
+    if sys.platform == "win32":
+        mode = "read-only" if readonly else "workspace-write"
+        probe_argv = runtime + ["--workspace", str(cwd), "--temp", str(sandbox_tmp),
+                                "--mode", mode, "--"] + _native_sandbox_shell_argv(probe)
+    else:
+        command = (f"cd {shlex.quote(str(cwd))} && "
+                   f"TMPDIR={shlex.quote(str(sandbox_tmp))} {probe}")
+        probe_argv = runtime + ["--settings", str(settings), "-c", command]
+    try:
+        result = subprocess.run(
+            probe_argv,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=_NATIVE_SANDBOX_PROBE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        _mark_native_sandbox_broken(
+            f"Native sandbox probe timed out after {_NATIVE_SANDBOX_PROBE_TIMEOUT}s.",
+            quiet)
+        return False
+    except OSError as exc:
+        _mark_native_sandbox_broken(f"Native sandbox probe could not start: {exc}", quiet)
+        return False
+    if result.returncode:
+        _mark_native_sandbox_broken((result.stderr or result.stdout or
+                                     f"Native sandbox probe exited {result.returncode}.").strip(),
+                                    quiet)
+        return False
+    _native_sandbox_verified = True
+    return True
+
+
+def native_sandbox_verified() -> bool:
+    """Whether this process has successfully executed the native probe."""
+    return _native_sandbox_verified is True
+
+
+# Signatures of the daemon refusing BEFORE the container ran, so the command did
+# not execute and retrying elsewhere repeats nothing. The mount entries are the
+# in-container case: the daemon resolves a bind source against the host, so a
+# path that exists only inside this container does not exist as far as it is
+# concerned.
+_DOCKER_SANDBOX_PREFLIGHT_ERRORS = (
+    "bind source path does not exist",
+    "invalid mount config",
+    "cannot connect to the docker daemon",
+    "is the docker daemon running",
+    "error during connect",
+    "permission denied while trying to connect",
+)
+
+
+def _docker_sandbox_unusable(result: str) -> bool:
+    lowered = (result or "").lower()
+    return any(marker in lowered for marker in _DOCKER_SANDBOX_PREFLIGHT_ERRORS)
+
+
+def _mark_docker_sandbox_broken(result: str) -> None:
+    """Latch a docker pre-flight failure and keep a local diagnostic."""
+    global _docker_sandbox_broken, _docker_sandbox_verified, _docker_sandbox_failure
+    first_failure = not _docker_sandbox_broken
+    _docker_sandbox_broken = True
+    _docker_sandbox_verified = False
+    _docker_sandbox_failure = (result or "Docker sandbox probe failed.").strip()
+    if first_failure:
+        _log.warning("docker sandbox could not start. %s",
+                     _docker_sandbox_repair_hint(_docker_sandbox_failure))
+
+
+def _docker_sandbox_repair_hint(result: str) -> str:
+    """Say which of the two docker failures this is, and what fixes it."""
+    lowered = (result or "").lower()
+    if "bind source path does not exist" in lowered or "invalid mount config" in lowered:
+        hint = ("The Docker daemon cannot see the workspace directory. It resolves "
+                "bind mounts on the host, so the workspace must exist at the same "
+                "absolute path there.")
+        if _running_in_container():
+            hint += (" Agent8088 is running in a container: mount the project at an "
+                     "identical path inside and outside it, or run Agent8088 on the "
+                     "Docker host.")
+        return hint
+    return "Install and start Docker, then retry."
+
+
+def _docker_image_present(image: str) -> bool:
+    """Whether `image` is already local. Never pulls.
+
+    The startup probe must not trigger a 300s image download; a missing image is
+    reported as unverified so the first real call can pull on its own budget.
+    """
+    if image in _docker_images_present:
+        return True
+    probe = _exec_process(
+        ["docker", "image", "inspect", "--format", "present", image], timeout=30)
+    if "present" in probe and "exited with status" not in probe:
+        _docker_images_present.add(image)
+        return True
+    return False
+
+
+def _docker_sandbox_ready(workspace: Path, image: str = "") -> bool:
+    """Run one real docker no-op with the workspace mounted, before trusting it.
+
+    Cached per workspace: `execute_shell` mounts artifacts/ while the git tools
+    mount the project root, and one can be host-visible when the other is not.
+    Returning False here is not fatal on its own — an unpulled image is reported
+    unverified rather than broken, so the real call can still try.
+    """
+    global _docker_sandbox_verified
+    if _docker_sandbox_broken:
+        return False
+    if not _docker_available():
+        return False
+    try:
+        workspace = Path(workspace).resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _mark_docker_sandbox_broken(f"Docker sandbox probe could not prepare: {exc}")
+        return False
+    key = str(workspace)
+    if key in _docker_workspace_verified:
+        return _docker_workspace_verified[key]
+    selected_image = image or DOCKER_IMAGE
+    if not _DOCKER_IMAGE_RE.fullmatch(selected_image) or not _docker_image_present(selected_image):
+        return False
+    try:
+        result = subprocess.run(
+            ["docker", "run", "--rm", "--network", "none",
+             "--memory", "128m", "--cap-drop", "ALL",
+             "--security-opt", "no-new-privileges",
+             "--mount", f"type=bind,src={key},dst=/workspace,readonly",
+             "--entrypoint", "/bin/sh", selected_image, "-c", "true"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=_DOCKER_SANDBOX_PROBE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        _mark_docker_sandbox_broken(
+            f"Docker sandbox probe timed out after {_DOCKER_SANDBOX_PROBE_TIMEOUT}s.")
+        return False
+    except OSError as exc:
+        _mark_docker_sandbox_broken(f"Docker sandbox probe could not start: {exc}")
+        return False
+    if result.returncode:
+        detail = (result.stderr or result.stdout or
+                  f"Docker sandbox probe exited {result.returncode}.").strip()
+        if _docker_sandbox_unusable(detail):
+            _mark_docker_sandbox_broken(detail)
+        else:
+            # An image or entrypoint quirk, not a structural failure. Leave the
+            # backend in play and let the real call speak for itself.
+            _docker_workspace_verified[key] = False
+        return False
+    _docker_workspace_verified[key] = True
+    if _docker_sandbox_verified is None:
+        _docker_sandbox_verified = True
+    return True
+
+
+def docker_sandbox_verified() -> bool:
+    """Whether this process has successfully executed the docker probe."""
+    return _docker_sandbox_verified is True
+
+
+def verify_sandbox_backend() -> dict:
+    """Settle which sandbox this process will use, once, before anything runs.
+
+    Native first, docker only when native cannot run — so on a healthy machine
+    docker is never probed at all. Called from startup so `/sandbox`, `/doctor`
+    and describe_capabilities report a tested answer from the first prompt
+    instead of "unverified", and so the failure is announced while the operator
+    is still looking, not midway through a turn.
+
+    Platform-neutral by design: Windows, macOS and Linux all arrive at the same
+    two checks. The only platform-specific step is provisioning, which stays in
+    install_native_sandbox().
+    """
+    requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
+    if requested != "docker" and not _native_sandbox_missing_requirements():
+        if _native_sandbox_ready(ARTIFACTS_ROOT):
+            return sandbox_status()
+    if requested != "native" or _native_sandbox_broken:
+        _docker_sandbox_ready(ARTIFACTS_ROOT)
+    return sandbox_status()
+
+
 def _native_or_docker(native, docker):
     """Run native isolation, retrying only a proven pre-flight failure."""
-    global _native_sandbox_broken
-    if _native_sandbox_broken and _docker_available():
-        return docker()
+    if _native_sandbox_broken:
+        return docker() if _docker_usable() else _sandbox_required_error()
     result = native()
-    if not _native_sandbox_unusable(result) or not _docker_available():
+    if not _native_sandbox_unusable(result):
         return result
-    if not _native_sandbox_broken:
-        _log.warning("native sandbox could not start, using docker for the "
-                     "rest of this session. %s", _native_sandbox_repair_hint(result))
-    _native_sandbox_broken = True
-    return docker()
+    _mark_native_sandbox_broken(result)
+    return docker() if _docker_usable() else _sandbox_required_error()
 
 
 def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
@@ -3469,8 +3860,14 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
     if not argv:
         return "Native sandbox runtime is unavailable."
     cwd = (cwd or ARTIFACTS_ROOT).resolve()
-    settings = _write_sandbox_settings(readonly, cwd)
     sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
+    if sys.platform == "win32":
+        mode = "read-only" if readonly else "workspace-write"
+        wrapped = _native_sandbox_shell_argv(command)
+        full_argv = argv + ["--workspace", str(cwd), "--temp", str(sandbox_tmp),
+                            "--mode", mode, "--"] + wrapped
+        return _exec_process(full_argv, timeout=timeout)
+    settings = _write_sandbox_settings(readonly, cwd)
     command = (f"cd {shlex.quote(str(cwd))} && "
                f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
     return _exec_process(
@@ -3492,16 +3889,21 @@ def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
         )
 
     if backend == "native":
+        if not _native_sandbox_ready(PROJECT_ROOT, readonly=True):
+            return docker() if _docker_usable() else _sandbox_required_error()
         runtime = _native_sandbox_argv()
-        settings = _write_sandbox_settings(readonly=True)
         sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
-        native_command = (f"cd {shlex.quote(str(PROJECT_ROOT))} && "
-                          f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
+        if sys.platform == "win32":
+            wrapped = _native_sandbox_shell_argv(command)
+            native_argv = runtime + ["--workspace", str(PROJECT_ROOT), "--temp",
+                                     str(sandbox_tmp), "--mode", "read-only", "--"] + wrapped
+        else:
+            settings = _write_sandbox_settings(readonly=True)
+            native_command = (f"cd {shlex.quote(str(PROJECT_ROOT))} && "
+                              f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
+            native_argv = runtime + ["--settings", str(settings), "-c", native_command]
         return _native_or_docker(
-            lambda: _exec_process(
-                runtime + ["--settings", str(settings), "-c", native_command],
-                timeout=timeout,
-            ),
+            lambda: _exec_process(native_argv, timeout=timeout),
             docker,
         )
     if backend == "docker":
@@ -3575,18 +3977,28 @@ def _to_container_path(command: str, workspace: Path) -> str:
         rewritten)
 
 
+def _running_in_container() -> bool:
+    return os.path.exists("/.dockerenv")
+
+
 def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
                          image: str = "", workspace: Path | None = None,
                          readonly: bool = False) -> str:
     selected_image = image or DOCKER_IMAGE
     if not _DOCKER_IMAGE_RE.fullmatch(selected_image):
         return f"Error: invalid container image name: {selected_image}"
-    unavailable = _ensure_docker_image(selected_image)
-    if unavailable:
-        return unavailable
-    workspace_path = workspace or ARTIFACTS_ROOT
+    if _docker_sandbox_broken:
+        return _docker_unavailable_error()
+    workspace_path = Path(workspace or ARTIFACTS_ROOT)
     if hasattr(workspace_path, "resolve"):
         workspace_path = workspace_path.resolve()
+    if hasattr(workspace_path, "mkdir"):
+        workspace_path.mkdir(parents=True, exist_ok=True)
+    unavailable = _ensure_docker_image(selected_image)
+    if unavailable:
+        _log.warning("Docker sandbox image is unavailable: %s", unavailable)
+        return (f"Error: container image {selected_image} is unavailable or missing. "
+                "Install and start Docker, then retry.")
     workspace = str(workspace_path)
     container_name = f"agent8088-{os.getpid()}-{uuid.uuid4().hex[:12]}"
     git_image = selected_image.startswith("alpine/git:")
@@ -3634,15 +4046,50 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
             )
         except (OSError, subprocess.TimeoutExpired):
             pass
+    # The daemon refusing before the container started is a pre-flight failure:
+    # nothing ran, so latching it and answering with a diagnosis repeats no work.
+    # Raw daemon text must not reach the model as though the command printed it.
+    if _docker_sandbox_unusable(result):
+        _mark_docker_sandbox_broken(result)
+        return _docker_unavailable_error()
     return result
 
 
 def _sandbox_required_error() -> str:
+    """Why no sandbox is usable, using what the probes actually found.
+
+    The generic wording tells the reader to install Docker, which is wrong — and
+    misleading — when Docker is installed, running, and merely unable to see the
+    workspace. Whatever a probe learned is the most useful thing to say, so say
+    that instead and keep the generic text for the case where nothing is known.
+    """
+    reasons = []
+    if _native_sandbox_broken and _native_sandbox_failure:
+        reasons.append("Native sandbox: " + _native_sandbox_repair_hint(
+            _native_sandbox_failure, include_reason=False))
+    if _docker_sandbox_broken and _docker_sandbox_failure:
+        reasons.append(f"Docker: {_docker_sandbox_repair_hint(_docker_sandbox_failure)}")
+    if reasons:
+        return ("Error: a sandbox is required to run code and none is usable. "
+                + " ".join(reasons) + " Local execution is disabled.")
     return (
         "Error: a sandbox is required to run code, but neither the native OS "
         "sandbox nor Docker is available. Run `agent8088 --sandbox-setup` or "
         "install and start Docker, then retry. Local execution is disabled."
     )
+
+
+def _docker_unavailable_error() -> str:
+    """Why the docker backend refused, and what would make it work.
+
+    Carries the probe's own diagnosis rather than a guess. The previous version
+    asserted the workspace "is not host-visible" purely from /.dockerenv, which
+    was false whenever the project was mounted at a matching path — the one
+    configuration in which docker-in-docker does work.
+    """
+    hint = _docker_sandbox_repair_hint(_docker_sandbox_failure)
+    return (f"Error: the Docker sandbox is unavailable. {hint} "
+            "Local execution is disabled.")
 
 
 _ARTIFACTS_CD_RE = re.compile(
@@ -3699,6 +4146,10 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
         command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
     try:
         if backend == "native":
+            if not _native_sandbox_ready(workspace, readonly=_sandbox_readonly):
+                return (_exec_docker_command(command, timeout, python_code, image,
+                                             workspace=workspace)
+                        if _docker_usable() else _sandbox_required_error())
             local_command = (
                 _process_display([sys.executable, "-c", command])
                 if python_code else command
@@ -3735,26 +4186,30 @@ def install_native_sandbox() -> str:
 
     runtime_dir = _agent_data_dir() / "runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    result = _exec_process([
-        npm, "install", "--prefix", str(runtime_dir), "--no-audit", "--no-fund",
-        f"@anthropic-ai/sandbox-runtime@{SANDBOX_RUNTIME_VERSION}",
-    ], timeout=300)
+    if sys.platform == "win32":
+        result = _exec_process([
+            npm, "install", "--prefix", str(runtime_dir), "--no-audit", "--no-fund",
+            "--legacy-peer-deps",
+            f"@deepseek-ai/dsh-sandbox-windows-acl@{_DSH_SANDBOX_ACL_VERSION}",
+        ], timeout=300)
+    else:
+        result = _exec_process([
+            npm, "install", "--prefix", str(runtime_dir), "--no-audit", "--no-fund",
+            f"@anthropic-ai/sandbox-runtime@{SANDBOX_RUNTIME_VERSION}",
+        ], timeout=300)
     if "exited with status" in result or "timed out" in result:
         return result
-    if sys.platform == "win32":
-        runtime = _native_sandbox_argv()
-        if not runtime:
-            return "Native sandbox runtime installed but its CLI could not be located."
-        setup = _exec_process([*runtime, "windows-install"], timeout=300)
-        if "exited with status" in setup or "timed out" in setup:
-            return setup
     missing = _native_sandbox_missing_requirements()
     if missing:
         return (
-            f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed. "
+            "Native sandbox runtime installed. "
             f"Install the remaining OS packages: {', '.join(missing)}."
         )
-    return f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed."
+    if not _native_sandbox_ready(ARTIFACTS_ROOT, quiet=True):
+        return ("Native sandbox runtime installed but could not "
+                f"be verified. {_native_sandbox_repair_hint(_native_sandbox_failure)} "
+                "Docker will be used when available.")
+    return "Native sandbox runtime installed and verified."
 
 
 def _tool_arg_parse_error(name: str, raw: str) -> str:
@@ -4201,7 +4656,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=query[:120], reason="outbound_secret")
             return leak
-        if (not _local_searxng_no_prompt_enabled()
+        local_no_prompt = _local_searxng_no_prompt_enabled()
+        if (not local_no_prompt
                 and not check_permission(mode, f"web_search: {query[:80]}",
                                          approval_key=approval_key)):
             _audit("escalation_requested", tool=name, mode=mode,
@@ -4213,15 +4669,47 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                 change_type="network_request",
                 reason=f"Tool '{name}' wants to search the web for: {query[:160]}",
             )
+        config = _search_config()
+        context = _search_context()
+        if local_no_prompt and _take_search_fallback_grant(approval_key):
+            # The operator approved this exact query leaving the local instance.
+            # Do not reopen the whole chain: DDGS is the requested fallback.
+            config["web_search_provider"] = "ddgs"
+            _audit("tool_call", tool=name, mode=mode, decision="allowed",
+                   detail=query[:200], change_type="network_fallback")
+            return _frame_search_results(web_search.run_search(
+                query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context))
+
         _audit("tool_call", tool=name, mode=mode, decision="allowed",
                detail=query[:200])
-        return _frame_search_results(web_search.run_search(
-            query, _web_search_limit(), WEB_SEARCH_REGISTRY, _search_config(),
-            _search_context()))
+        if not local_no_prompt:
+            return _frame_search_results(web_search.run_search(
+                query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context))
+        outcome = web_search.run_search(
+            query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context,
+            return_failures=True)
+        # Embedders may supply an older custom registry implementation. A plain
+        # string is still a valid result; it simply cannot request this fallback.
+        if not isinstance(outcome, tuple):
+            return _frame_search_results(outcome)
+        result, failures = outcome
+        if failures == ("searxng",):
+            _audit("escalation_requested", tool=name, mode=mode,
+                   decision="blocked", detail=query[:120],
+                   change_type="network_fallback")
+            return request_escalation(
+                target_mode="edit",
+                paths=[f"web_search (DDGS): {query[:100]}"],
+                change_type="network_fallback",
+                reason=("Local SearXNG returned no results. Retry this exact query "
+                        "with public DuckDuckGo search?"),
+            )
+        return _frame_search_results(result)
 
     # --- Permission gate for writes, shell, containers, cron, and browser ---
     command = ""
     write_path = ""
+    target = None
     path_zone = "default"
     shadowed = None
     if mode == "shell":
@@ -4374,7 +4862,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             paths_str = command
         sandbox_missing = mode in ("shell", "docker") and _resolve_sandbox_backend() == "unavailable"
         change_type = {
-            "write_text": "new_file",
+            "write_text": "overwrite" if target is not None and target.exists() else "new_file",
             "cron": "scheduled_task",
             "browser": "network_request",
             "mcp": "mcp_tool",
@@ -4526,7 +5014,7 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
 
     # Taken before the call runs: once it has written, the previous state is the
     # one thing that cannot be reconstructed.
-    will_audit = _approved_plan_audit_applies(name, depth)
+    will_audit = _audit_applies(name, depth)
     snapshot = _capture_write_state(name, args) if will_audit and PLAN_AUDIT_REVERT else None
 
     try:
@@ -5327,11 +5815,8 @@ def _ssrf_check(url: str):
     if not host:
         return "Blocked: URL has no host."
     # Explicitly allowlisted internal host (match on host and on host:port).
-    if SSRF_ALLOW_HOSTS:
-        hl = host.lower()
-        if hl in SSRF_ALLOW_HOSTS or (
-                parts.port and f"{hl}:{parts.port}" in SSRF_ALLOW_HOSTS):
-            return None
+    if _ssrf_host_allowlisted(host, parts.port):
+        return None
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception:
@@ -5346,6 +5831,13 @@ def _ssrf_check(url: str):
             return (f"Blocked: '{host}' resolves to internal address {ip}. "
                     "Requests to private/loopback/link-local networks are not allowed.")
     return None
+
+
+def _ssrf_host_allowlisted(host: str, port: int | None = None) -> bool:
+    """Match the narrow SSRF allowlist without performing DNS."""
+    host = (host or "").lower()
+    return bool(host and (host in SSRF_ALLOW_HOSTS or
+                          (port and f"{host}:{port}" in SSRF_ALLOW_HOSTS)))
 
 
 def _host_matches(host: str, domain: str) -> bool:
@@ -6108,12 +6600,20 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if trace is not None:
                 trace.append({"turn": turn, "type": "budget_exceeded", "content": over})
             return answer
+        # After a length cutoff, the one retry gets a bigger budget (capped by
+        # the model's context window) — the same fixed budget would just
+        # reproduce the same cutoff if the model reasons a similar amount again.
+        turn_max_tokens = (
+            min(MAX_COMPLETION_TOKENS * 2, CONTEXT_WINDOW)
+            if length_retries else MAX_COMPLETION_TOKENS
+        )
         try:
             with spin("thinking..."):
                 response = _create_completion_with_fallback(
                     messages, round_tools_def, temperature=temperature,
                     system_prompt=round_system_prompt, on_token=on_token,
                     interrupt_check=interrupt_check, trace=trace, turn=turn,
+                    max_tokens=turn_max_tokens,
                 )
         except AgentInterrupted:
             raise
@@ -6142,17 +6642,32 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         finish_reason = str(getattr(response.choices[0], "finish_reason", "") or "").lower()
         if finish_reason in {"length", "max_tokens"}:
             warning = (
-                f"Model output reached its {MAX_COMPLETION_TOKENS}-token limit. "
-                "The partial response was not executed. Retry with one complete, "
-                "concise tool call; split large work across calls if needed."
+                f"Model output reached its {turn_max_tokens}-token limit. "
+                "The partial response was not executed."
             )
+            if content:
+                # A genuinely large answer/tool call was in progress.
+                retry_instruction = (
+                    f"{warning} Retry with one complete, concise tool call; "
+                    "split large work across calls if needed."
+                )
+            else:
+                # The whole budget was spent on reasoning before any answer or
+                # tool call appeared — "split work into calls" doesn't address
+                # that, so it reliably repeats the same failure.
+                retry_instruction = (
+                    f"{warning} That budget was spent entirely on reasoning "
+                    "with no answer produced. Stop reasoning now and reply "
+                    "immediately in plain text, or call one tool — do not "
+                    "think out loud."
+                )
             if on_result:
                 on_result("error", warning)
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
             if length_retries < 1:
                 length_retries += 1
-                messages.append({"role": "user", "content": warning})
+                messages.append({"role": "user", "content": retry_instruction})
                 continue
             answer = _guard_answer(warning)
             if on_answer:
