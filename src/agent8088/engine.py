@@ -1640,8 +1640,10 @@ def _retryable_model_error(error: Exception) -> bool:
 
 
 def _create_completion_with_fallback(messages, tools, *, temperature, system_prompt,
-                                     on_token, interrupt_check, trace, turn):
+                                     on_token, interrupt_check, trace, turn,
+                                     max_tokens=None):
     emitted = False
+    max_tokens = max_tokens if max_tokens is not None else MAX_COMPLETION_TOKENS
 
     def tracked_token(kind, delta):
         nonlocal emitted
@@ -1653,7 +1655,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
     try:
         return create_completion(
             client, messages, tools, temperature=temperature,
-            max_tokens=MAX_COMPLETION_TOKENS,
+            max_tokens=max_tokens,
             system_prompt=system_prompt, on_token=token_handler,
             interrupt_check=interrupt_check,
             provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
@@ -1680,7 +1682,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 })
             return create_completion(
                 fallback_client, messages, tools, temperature=temperature,
-                max_tokens=MAX_COMPLETION_TOKENS,
+                max_tokens=max_tokens,
                 system_prompt=system_prompt, on_token=token_handler,
                 interrupt_check=interrupt_check, model_name=model_name,
                 provider_name=provider_name, telemetry_attempt="fallback",
@@ -1935,25 +1937,41 @@ def _resolve_tool_name(name):
 RUNTIME_CONTEXT_HEADING = "\n\n## Runtime Context\n"
 
 
-def render_runtime_context(now=None) -> str:
-    """Tell the model what day it is.
+def render_runtime_context(now=None, channel: str = "", chat_type: str = "") -> str:
+    """Tell the model what day it is, and which model/channel it's running as.
 
-    Without this it has no clock — only a training cutoff — so "the next
-    election" silently means whatever was next while it was trained, and a
-    page from years ago reads as current. Every date-aware behaviour in the
+    Without the date block it has no clock — only a training cutoff — so "the
+    next election" silently means whatever was next while it was trained, and
+    a page from years ago reads as current. Every date-aware behaviour in the
     search path depends on this block being present.
 
     Rendered per turn rather than at import: a gateway or cron process runs
-    for days and would otherwise keep answering with the date it booted on.
+    for days and would otherwise keep answering with the date it booted on,
+    the model it booted with (after a live /model switch), and no channel.
+
+    `channel`/`chat_type` are supplied by the gateway (platform + whether the
+    message is a direct message or a group/channel one) and left blank for
+    the CLI, which has no such notion.
     """
     moment = now or datetime.now().astimezone()
-    return (
+    model_line = f"- You are Agent8088, currently running on model `{MODEL_NAME}`"
+    if ACTIVE_PROVIDER:
+        model_line += f" via the `{ACTIVE_PROVIDER}` provider"
+    model_line += (". If asked what model or provider is powering you, answer plainly "
+                    "and accurately from this line — it is not confidential.\n")
+    lines = [
         f"{RUNTIME_CONTEXT_HEADING}"
         f"- Today is {moment.strftime('%A, %d %B %Y')}.\n"
         f"- Current year: {moment.year}. Current month: {moment.strftime('%B %Y')}.\n"
         "- Your training data is older than today. For anything current, "
-        "time-sensitive, or scheduled, search rather than answering from memory.\n"
-    )
+        "time-sensitive, or scheduled, search rather than answering from memory.\n",
+        model_line,
+    ]
+    if channel:
+        kind = "a direct message" if chat_type == "private" else "a group/channel"
+        lines.append(f"- You are replying over the messaging gateway, on {channel}, in "
+                      f"{kind}. Keep formatting light here — see Messaging Gateway below.\n")
+    return "".join(lines)
 
 
 def current_system_prompt() -> str:
@@ -3215,7 +3233,19 @@ def _playwright_available() -> bool:
 def _exec_browser(args: dict) -> str:
     """Load a page in a headless browser and return its text, optionally scoped to
     a CSS selector. Handles JS-rendered pages that curl cannot. SSRF-guarded.
-    Degrades with install instructions when Playwright isn't present."""
+    Degrades with install instructions when Playwright isn't present.
+
+    `playwright` the Python package is a core dependency (always installed),
+    but the Chromium *browser binary* is a separate ~280 MB download the
+    installer fetches afterward and can fail or be skipped independently
+    (network blip, disk space, antivirus). `_playwright_available` alone
+    cannot see that gap - it would report available and let the missing-binary
+    case fall through to playwright's own multi-paragraph "Executable doesn't
+    exist" error, which reads as a crash rather than an install step. Checking
+    the resolved executable_path up front, inside the same driver session
+    launch() would use, catches that case with the same clear message as a
+    fully-missing install.
+    """
     url = str(args.get("url") or "").strip()
     if not url:
         return "Error: browser tool requires 'url'."
@@ -3230,6 +3260,10 @@ def _exec_browser(args: dict) -> str:
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
+            if not os.path.exists(p.chromium.executable_path):
+                return ("Playwright's Chromium browser is not installed. Install it with:\n"
+                        "  playwright install chromium\n"
+                        "Until then, use web_search or get_page_title instead.")
             browser = p.chromium.launch(headless=True)
             try:
                 page = browser.new_page()
@@ -3316,6 +3350,26 @@ def _agent_data_dir() -> Path:
     return Path.home() / ".agent8088"
 
 
+_DSH_SANDBOX_ACL_VERSION = "0.1.0-rc.7"  # pin exact - pre-1.0 package, no ranges
+
+
+def _native_sandbox_shell_argv(command: str) -> list:
+    """Wrap a shell command string for cmd.exe.
+
+    The Windows ACL runner execs argv directly and has no shell semantics of
+    its own (no &&, no VAR=value env-prefix syntax) - cmd.exe does the
+    interpreting instead of the runner.
+    """
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    cmd_exe = str(Path(system_root) / "System32" / "cmd.exe")
+    return [cmd_exe, "/d", "/s", "/c", command]
+
+
+def _dsh_runner_path() -> Path:
+    return (_agent_data_dir() / "runtime" / "node_modules" / "@deepseek-ai"
+            / "dsh-sandbox-windows-acl" / "lib" / "runner.js")
+
+
 def _native_sandbox_argv():
     override = os.environ.get("AGENT8088_SRT")
     if override:
@@ -3324,6 +3378,12 @@ def _native_sandbox_argv():
             argv = [part[1:-1] if len(part) > 1 and part[0] == part[-1] == '"'
                     else part for part in argv]
         return argv
+    if sys.platform == "win32":
+        node = _which_executable("node")
+        runner = _dsh_runner_path()
+        if not node or not runner.exists():
+            return None
+        return [node, str(runner)]
     cli = (_agent_data_dir() / "runtime" / "node_modules"
            / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js")
     node = _which_executable("node")
@@ -3340,6 +3400,12 @@ def _native_sandbox_missing_requirements() -> list:
         required = ("sandbox-exec", "rg")
     elif sys.platform.startswith("linux"):
         required = ("bwrap", "socat", "rg")
+    elif sys.platform == "win32":
+        missing = []
+        koffi_dir = _agent_data_dir() / "runtime" / "node_modules" / "koffi"
+        if not koffi_dir.is_dir():
+            missing.append("koffi native addon")
+        return missing
     else:
         required = ()
     return [command for command in required if not shutil.which(command)]
@@ -3511,6 +3577,7 @@ _NATIVE_SANDBOX_PREFLIGHT_ERRORS = (
     "CreateProcessWithLogonW",
     "Secondary Logon service",
     "srt-win: error:",
+    "windows-acl-run:",
     "bwrap: No permissions to create new namespace",
     "bwrap: Creating new namespace failed",
     "bwrap: Can't mount proc",
@@ -3545,13 +3612,12 @@ def _native_sandbox_repair_hint(result: str, include_reason: bool = True) -> str
     if "Native sandbox runtime is unavailable" in text:
         return "The runtime is not installed. Run `agent8088 --sandbox-setup`."
     checks = ""
-    if "CreateProcessWithLogonW" in text or "Access is denied" in text:
-        checks = ("Windows refused the spawn as the sandbox account. Worth "
-                  "checking: the Secondary Logon service (seclogon) is running, "
-                  "local policy grants that account a logon right, and no "
-                  "antivirus behaviour shield is blocking it. If the account "
-                  "already exists and reprovisioning does not change this, it is "
-                  "a sandbox-runtime issue rather than your configuration.")
+    if "windows-acl-run:" in text:
+        checks = ("The Windows ACL sandbox runner refused to start. Run "
+                  "`agent8088 --sandbox-setup` to reinstall it.")
+    elif "CreateProcessWithLogonW" in text or "Access is denied" in text:
+        checks = ("Windows refused the spawn. Run `agent8088 --sandbox-setup` "
+                  "to reinstall the native sandbox.")
     if not include_reason:
         return checks or "The native sandbox could not start."
     reason = f"Reason: {text[:200]}" if text else "Reason: not reported."
@@ -3613,11 +3679,17 @@ def _native_sandbox_ready(cwd: Path, readonly: bool = False,
         _mark_native_sandbox_broken(f"Native sandbox probe could not prepare: {exc}", quiet)
         return False
     probe = _process_display([sys.executable, "-c", "pass"])
-    command = (f"cd {shlex.quote(str(cwd))} && "
-               f"TMPDIR={shlex.quote(str(sandbox_tmp))} {probe}")
+    if sys.platform == "win32":
+        mode = "read-only" if readonly else "workspace-write"
+        probe_argv = runtime + ["--workspace", str(cwd), "--temp", str(sandbox_tmp),
+                                "--mode", mode, "--"] + _native_sandbox_shell_argv(probe)
+    else:
+        command = (f"cd {shlex.quote(str(cwd))} && "
+                   f"TMPDIR={shlex.quote(str(sandbox_tmp))} {probe}")
+        probe_argv = runtime + ["--settings", str(settings), "-c", command]
     try:
         result = subprocess.run(
-            runtime + ["--settings", str(settings), "-c", command],
+            probe_argv,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             timeout=_NATIVE_SANDBOX_PROBE_TIMEOUT,
         )
@@ -3808,8 +3880,14 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
     if not argv:
         return "Native sandbox runtime is unavailable."
     cwd = (cwd or ARTIFACTS_ROOT).resolve()
-    settings = _write_sandbox_settings(readonly, cwd)
     sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
+    if sys.platform == "win32":
+        mode = "read-only" if readonly else "workspace-write"
+        wrapped = _native_sandbox_shell_argv(command)
+        full_argv = argv + ["--workspace", str(cwd), "--temp", str(sandbox_tmp),
+                            "--mode", mode, "--"] + wrapped
+        return _exec_process(full_argv, timeout=timeout)
+    settings = _write_sandbox_settings(readonly, cwd)
     command = (f"cd {shlex.quote(str(cwd))} && "
                f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
     return _exec_process(
@@ -3834,15 +3912,18 @@ def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
         if not _native_sandbox_ready(PROJECT_ROOT, readonly=True):
             return docker() if _docker_usable() else _sandbox_required_error()
         runtime = _native_sandbox_argv()
-        settings = _write_sandbox_settings(readonly=True)
         sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
-        native_command = (f"cd {shlex.quote(str(PROJECT_ROOT))} && "
-                          f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
+        if sys.platform == "win32":
+            wrapped = _native_sandbox_shell_argv(command)
+            native_argv = runtime + ["--workspace", str(PROJECT_ROOT), "--temp",
+                                     str(sandbox_tmp), "--mode", "read-only", "--"] + wrapped
+        else:
+            settings = _write_sandbox_settings(readonly=True)
+            native_command = (f"cd {shlex.quote(str(PROJECT_ROOT))} && "
+                              f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
+            native_argv = runtime + ["--settings", str(settings), "-c", native_command]
         return _native_or_docker(
-            lambda: _exec_process(
-                runtime + ["--settings", str(settings), "-c", native_command],
-                timeout=timeout,
-            ),
+            lambda: _exec_process(native_argv, timeout=timeout),
             docker,
         )
     if backend == "docker":
@@ -4125,30 +4206,42 @@ def install_native_sandbox() -> str:
 
     runtime_dir = _agent_data_dir() / "runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    result = _exec_process([
-        npm, "install", "--prefix", str(runtime_dir), "--no-audit", "--no-fund",
-        f"@anthropic-ai/sandbox-runtime@{SANDBOX_RUNTIME_VERSION}",
-    ], timeout=300)
+    if sys.platform == "win32":
+        result = _exec_process([
+            npm, "install", "--prefix", str(runtime_dir), "--no-audit", "--no-fund",
+            "--legacy-peer-deps",
+            f"@deepseek-ai/dsh-sandbox-windows-acl@{_DSH_SANDBOX_ACL_VERSION}",
+        ], timeout=300)
+    else:
+        result = _exec_process([
+            npm, "install", "--prefix", str(runtime_dir), "--no-audit", "--no-fund",
+            f"@anthropic-ai/sandbox-runtime@{SANDBOX_RUNTIME_VERSION}",
+        ], timeout=300)
     if "exited with status" in result or "timed out" in result:
         return result
-    if sys.platform == "win32":
-        runtime = _native_sandbox_argv()
-        if not runtime:
-            return "Native sandbox runtime installed but its CLI could not be located."
-        setup = _exec_process([*runtime, "windows-install"], timeout=300)
-        if "exited with status" in setup or "timed out" in setup:
-            return setup
     missing = _native_sandbox_missing_requirements()
     if missing:
         return (
-            f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed. "
+            "Native sandbox runtime installed. "
             f"Install the remaining OS packages: {', '.join(missing)}."
         )
+    global _native_sandbox_broken, _native_sandbox_verified
     if not _native_sandbox_ready(ARTIFACTS_ROOT, quiet=True):
-        return (f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed but could not "
-                f"be verified. {_native_sandbox_repair_hint(_native_sandbox_failure)} "
-                "Docker will be used when available.")
-    return f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed and verified."
+        # koffi.node was just written by the npm install above; on Windows a
+        # real-time antivirus scan can still hold a lock on it for a moment,
+        # making this first probe fail even though the runtime is fine. One
+        # retry after a short pause tells the two apart instead of reporting
+        # a permanent failure for a transient one. The latch has to be reset
+        # by hand - it is designed to stick for the rest of a normal session,
+        # but this is a one-shot setup command, not a long-lived process.
+        time.sleep(2)
+        _native_sandbox_broken = False
+        _native_sandbox_verified = None
+        if not _native_sandbox_ready(ARTIFACTS_ROOT, quiet=True):
+            return ("Native sandbox runtime installed but could not "
+                    f"be verified. {_native_sandbox_repair_hint(_native_sandbox_failure)} "
+                    "Docker will be used when available.")
+    return "Native sandbox runtime installed and verified."
 
 
 def _tool_arg_parse_error(name: str, raw: str) -> str:
@@ -4513,7 +4606,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     # allow_plan=False means we're INSIDE _exec_plan (a plan step) — let it through
     # to the normal check_permission gate so it escalates properly.
     plan_only_blocked = mode in ("write_text", "shell", "docker", "cron", "browser")
-    plan_only_blocked |= (mode == "search" and not _local_searxng_no_prompt_enabled())
+    plan_only_blocked |= (mode == "search" and not _local_searxng_no_prompt_enabled()
+                          and not _ddgs_only_chain())
     if PERMISSION_MODE == "plan-only" and allow_plan and plan_only_blocked:
         return _plan_mode_block_message()
 
@@ -4596,7 +4690,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                    detail=query[:120], reason="outbound_secret")
             return leak
         local_no_prompt = _local_searxng_no_prompt_enabled()
-        if (not local_no_prompt
+        ddgs_only = _ddgs_only_chain()
+        if (not local_no_prompt and not ddgs_only
                 and not check_permission(mode, f"web_search: {query[:80]}",
                                          approval_key=approval_key)):
             _audit("escalation_requested", tool=name, mode=mode,
@@ -4619,8 +4714,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             return _frame_search_results(web_search.run_search(
                 query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context))
 
+        _audit_extra = {"reason": "ddgs_no_prompt"} if ddgs_only and not local_no_prompt else {}
         _audit("tool_call", tool=name, mode=mode, decision="allowed",
-               detail=query[:200])
+               detail=query[:200], **_audit_extra)
         if not local_no_prompt:
             return _frame_search_results(web_search.run_search(
                 query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context))
@@ -6008,6 +6104,34 @@ def _local_searxng_no_prompt_enabled() -> bool:
         return False
 
 
+def _ddgs_only_chain() -> bool:
+    """True when ddgs is the only backend that would actually serve a search.
+
+    No SearXNG configured and no keyed backend (tavily/exa) enabled — ddgs,
+    the keyless fallback that ships with every install, is the entire chain.
+    Gating that behind an interactive "may I search the web?" prompt only
+    ever blocks the one backend nobody had to opt into, and does so on every
+    single call since there is no session-wide grant (see grant_escalation) —
+    which is exactly the failure mode that made web_search unusable with no
+    SearXNG/API-key backend configured. ddgs's own guards are unaffected:
+    _web_search_query_guard and _outbound_secret_check above still run before
+    this point, and DdgsProvider.search() still fails closed against its own
+    per-engine egress allowlist (web_search._ddgs_allowed_engines) — this only
+    removes the human-in-the-loop step, not any of the actual security checks.
+
+    Deliberately separate from _local_searxng_no_prompt_enabled: that opt-in
+    protects a deliberately LOCAL-only pin from silently escaping to the
+    public internet. There is no local backend here to escape from — ddgs
+    reaching the public internet is not a silent downgrade, it is the only
+    thing this chain was ever going to do.
+    """
+    try:
+        chain = WEB_SEARCH_REGISTRY.chain(_search_config(), _search_context())
+    except Exception:  # noqa: BLE001 — a chain probe failure must not block search
+        return False
+    return bool(chain) and all(provider.name == "ddgs" for provider in chain)
+
+
 def _search_config() -> dict:
     """APP_CONFIG as the search registry should see it.
 
@@ -6539,12 +6663,20 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if trace is not None:
                 trace.append({"turn": turn, "type": "budget_exceeded", "content": over})
             return answer
+        # After a length cutoff, the one retry gets a bigger budget (capped by
+        # the model's context window) — the same fixed budget would just
+        # reproduce the same cutoff if the model reasons a similar amount again.
+        turn_max_tokens = (
+            min(MAX_COMPLETION_TOKENS * 2, CONTEXT_WINDOW)
+            if length_retries else MAX_COMPLETION_TOKENS
+        )
         try:
             with spin("thinking..."):
                 response = _create_completion_with_fallback(
                     messages, round_tools_def, temperature=temperature,
                     system_prompt=round_system_prompt, on_token=on_token,
                     interrupt_check=interrupt_check, trace=trace, turn=turn,
+                    max_tokens=turn_max_tokens,
                 )
         except AgentInterrupted:
             raise
@@ -6573,17 +6705,32 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         finish_reason = str(getattr(response.choices[0], "finish_reason", "") or "").lower()
         if finish_reason in {"length", "max_tokens"}:
             warning = (
-                f"Model output reached its {MAX_COMPLETION_TOKENS}-token limit. "
-                "The partial response was not executed. Retry with one complete, "
-                "concise tool call; split large work across calls if needed."
+                f"Model output reached its {turn_max_tokens}-token limit. "
+                "The partial response was not executed."
             )
+            if content:
+                # A genuinely large answer/tool call was in progress.
+                retry_instruction = (
+                    f"{warning} Retry with one complete, concise tool call; "
+                    "split large work across calls if needed."
+                )
+            else:
+                # The whole budget was spent on reasoning before any answer or
+                # tool call appeared — "split work into calls" doesn't address
+                # that, so it reliably repeats the same failure.
+                retry_instruction = (
+                    f"{warning} That budget was spent entirely on reasoning "
+                    "with no answer produced. Stop reasoning now and reply "
+                    "immediately in plain text, or call one tool — do not "
+                    "think out loud."
+                )
             if on_result:
                 on_result("error", warning)
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
             if length_retries < 1:
                 length_retries += 1
-                messages.append({"role": "user", "content": warning})
+                messages.append({"role": "user", "content": retry_instruction})
                 continue
             answer = _guard_answer(warning)
             if on_answer:
@@ -6725,7 +6872,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             _raise_if_interrupted(interrupt_check)
             if on_tool:
                 on_tool(name)
-            with spin(f"running {name}..."):
+            # on_calls already announced "Searching the web..." once; this spinner
+            # is the next beat, not a repeat of it.
+            spin_msg = "Fetching results…" if name == "web_search" else f"running {name}..."
+            with spin(spin_msg):
                 result = exec_tool(name, json.dumps(args), depth=depth)
             if (PERMISSION_MODE == "plan-only"
                     and result.startswith("Error: plan mode")):
