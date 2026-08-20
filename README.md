@@ -48,7 +48,7 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 **macOS, Linux, or WSL2**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/RT-Internal-DS/Agent8088-Features-added/development/install.sh | AGENT8088_BRANCH=development bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/RT-Internal-DS/Agent8088-Features-added/development/install.sh | AGENT8088_BRANCH=development bash
 ```
 
 **Windows (PowerShell)**
