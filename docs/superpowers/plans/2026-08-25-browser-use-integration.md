@@ -19,6 +19,7 @@
 - Every LLM call browser-use's loop makes must be charged to the caller's `_TurnBudget` (the same object `run_agent`/`_exec_subagent` share) via `add_tokens`, using the exact field names `prompt_tokens`/`completion_tokens` from `ChatInvokeUsage`.
 - Final output returned to the model is capped at 5000 chars, run through `_strip_special_tokens`, then `_wrap_untrusted(..., url)` — same as today, no exceptions.
 - `selector` is removed from `browse_page`'s schema; `task` is added and required alongside `url`.
+- The `Agent(...)` construction in `_run_browser_agent` must pass `use_vision=False` — confirmed via live testing (not just reading docs) that the default `True` unconditionally sends a screenshot every step and hard-errors against any model that doesn't accept image input, which breaks `browse_page` outright for a real share of agent8088's supported providers. `"auto"` was checked and rejected too (still exposes an optional screenshot action the model can invoke on its own). `False` is the only mode verified to never send an image.
 
 ---
 
@@ -739,6 +740,18 @@ async def _run_browser_agent(url: str, task: str) -> str:
             llm=llm,
             browser_profile=profile,
             initial_actions=[{"navigate": {"url": url, "new_tab": False}}],
+            # browser-use defaults to use_vision=True (sends a screenshot with
+            # every step) and errors out entirely against a model that
+            # doesn't accept image input - which is exactly the situation for
+            # a large share of the providers/models agent8088 supports (local
+            # or text-only). Since this adapter is required to work with
+            # "whatever provider the user already has configured," not just
+            # vision-capable ones, screenshots must be off unconditionally.
+            # use_vision="auto" was considered and rejected: it still exposes
+            # a "screenshot" action the model can choose to call on its own,
+            # which would hit the same failure - only False fully disables
+            # both the automatic per-step screenshot and that action.
+            use_vision=False,
         )
         history = await asyncio.wait_for(
             agent.run(max_steps=BROWSER_MAX_STEPS),
