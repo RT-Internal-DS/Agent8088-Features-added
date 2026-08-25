@@ -109,10 +109,16 @@ wrapped so its actual completions route through agent8088's own model-calling
 function). This reuses whatever provider/model/base_url the user already has
 configured — no new credential surface.
 
-*Exact class name/import path to be confirmed against the installed
-browser-use version during implementation — Context7 docs surfaced
-`browser_use.llm.litellm.ChatLiteLLM` but library internals shift between
-releases.*
+Confirmed against browser-use 0.13.8 source directly (installed in a
+throwaway venv for inspection): `browser_use.llm.litellm.ChatLiteLLM` is a
+real `@dataclass` (fields: `model`, `api_key`, `api_base`, `temperature`,
+`max_tokens`, `max_retries`, `metadata`) implementing the `BaseChatModel`
+protocol (`browser_use.llm.base`) — `.provider`, `.name`, and async
+`ainvoke(messages, output_format=None, **kwargs) -> ChatInvokeCompletion`.
+Its `ainvoke` calls `litellm.acompletion(...)` directly and returns a
+`ChatInvokeCompletion` whose `.usage` is a `ChatInvokeUsage` with
+`prompt_tokens`/`completion_tokens`/`total_tokens`. Pin `browser-use>=0.13,<0.14`
+in dependencies to match what this design was verified against.
 
 ### 4. SSRF/egress guard: local filtering proxy
 
@@ -144,15 +150,21 @@ the duration of each `browse_page` call.
 - New config `browser_max_steps` (same pattern as existing
   `browser_timeout_ms`), passed to `Agent.run(max_steps=...)`. Default
   chosen to keep a single call's cost bounded (proposed: 25).
+- New config `browser_task_timeout_seconds` (proposed default: 300) bounds
+  the whole multi-step call via `asyncio.wait_for()` around `agent.run(...)`.
+  This is a *separate* knob from the existing `browser_timeout_ms` —
+  `browser_timeout_ms` is a single page-load timeout (20s default) and is
+  far too short to bound an entire multi-step session; reusing it for the
+  whole task would make most real tasks time out immediately. Deliberate
+  deviation from an earlier draft of this design, corrected once the actual
+  timeout math was checked. browser-use has no built-in overall wall-clock
+  timeout of its own (only per-step/per-LLM-call timeouts), so this wrapper
+  is still necessary.
 - Every LLM call browser-use's loop makes goes through the adapter from
   step 3, and is charged to `_active_budget` under a `subagent:browser`-style
   role — the same accounting pattern used for the auditor subagent
   (`_active_budget.role_total(...)`) — so a browsing task cannot spend
   tokens outside the user's existing budget ceiling.
-- `browser_timeout_ms` (existing config) continues to bound the whole call
-  via `asyncio.wait_for()` around `agent.run(...)`, since browser-use has no
-  single overall wall-clock timeout parameter of its own (only per-step/
-  per-LLM-call timeouts).
 
 ### 6. Output handling
 
@@ -206,12 +218,15 @@ produced it.
 
 ## Open questions / risks to verify during implementation
 
-- Confirm the exact `browser_use.llm.litellm.ChatLiteLLM` (or equivalent)
-  import path and constructor signature against the pinned browser-use
-  version — Context7 docs may lag a specific release.
-- Confirm `ProxySettings` is honored for *all* traffic browser-use's
-  CDP-launched Chromium makes (not just document navigation) — verify with
-  an integration test that deliberately tries a background XHR to a blocked
-  host, not just a top-level navigation.
-- Decide the default for `browser_max_steps` based on observed cost during
-  implementation testing (25 is a starting proposal, not a measured value).
+- `BrowserProfile(proxy=ProxySettings(server=...))` was confirmed (via
+  source inspection of browser-use 0.13.8) to translate into a real
+  Chromium `--proxy-server=` launch flag — this only covers browser-use
+  *launching its own* Chromium (our case), not connecting to an
+  already-running one. Still worth an integration test that deliberately
+  tries a background XHR to a blocked host, not just a top-level
+  navigation, to confirm Chromium itself routes all traffic through the
+  flag as expected.
+- Decide the final default for `browser_max_steps` and
+  `browser_task_timeout_seconds` based on observed cost/duration during
+  implementation testing (25 steps / 300s are starting proposals, not
+  measured values).
