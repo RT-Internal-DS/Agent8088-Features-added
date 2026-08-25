@@ -14,6 +14,7 @@
 
 - Tool name stays `browse_page`; mode string stays `browser` — no changes to permission gating, plan-only blocking, or audit logging in `engine.py`.
 - `browser-use` is pinned `>=0.13,<0.14` — this plan was verified line-by-line against the installed 0.13.8 source; a future major/minor bump needs its own re-verification pass, not a silent version bump.
+- `litellm` is a **core** dependency (`>=1,<2`), not the pre-existing optional `[litellm]` extra — every provider config's browsing calls route through it now (see Task 1's ruling), matching the existing `browser`/`search` core-promotion precedent already in `pyproject.toml`.
 - Every request the browsing session makes must pass through the SSRF-filtering proxy — no code path may launch browser-use's browser without `ProxySettings` pointed at it.
 - Every LLM call browser-use's loop makes must be charged to the caller's `_TurnBudget` (the same object `run_agent`/`_exec_subagent` share) via `add_tokens`, using the exact field names `prompt_tokens`/`completion_tokens` from `ChatInvokeUsage`.
 - Final output returned to the model is capped at 5000 chars, run through `_strip_special_tokens`, then `_wrap_untrusted(..., url)` — same as today, no exceptions.
@@ -21,42 +22,85 @@
 
 ---
 
-### Task 1: Add browser-use as a core dependency
+### Task 1: Add browser-use as a core dependency, and promote litellm to core too
 
 **Files:**
-- Modify: `pyproject.toml` (near the existing `playwright>=1.40,<2` line, ~line 27)
+- Modify: `pyproject.toml` (core `dependencies` list ~line 27; `[project.optional-dependencies]` block ~lines 48-68)
 - Modify: `requirements.txt` (near the existing `playwright>=1.40,<2` line, ~line 30)
 
 **Interfaces:**
-- Produces: the `browser_use` package importable in the venv used by later tasks (`import browser_use` succeeds; `from browser_use import Agent, BrowserProfile, ProxySettings` succeeds).
+- Produces: the `browser_use` and `litellm` packages importable in the venv used by later tasks (`import browser_use`, `import litellm`, and `from browser_use import Agent, BrowserProfile, ProxySettings` all succeed).
 
-- [ ] **Step 1: Add the dependency to `pyproject.toml`**
+**Ruling carried into this task (recorded during plan setup):** `litellm` is
+currently an *optional* extra (`pip install agent8088[litellm]`, only meant
+for a provider profile with `api_mode=litellm`) — see the comment directly
+above its line in `pyproject.toml`. Task 3's adapter always builds a
+`browser_use.llm.litellm.ChatLiteLLM` regardless of which provider the main
+agent loop is configured with, and that class unconditionally does
+`from litellm import acompletion` inside `ainvoke`. If `litellm` stays
+optional, `browse_page` breaks for any user who never opted into that
+extra — independent of which provider they actually use. This repo already
+has precedent for exactly this situation: `browser` and `search` were
+promoted from optional to core for the identical reason (see the comment
+above `browser = [...]` in `pyproject.toml`: "optional was the wrong
+trade... it made X a property of whether a best-effort install step
+happened to succeed, and both degrade silently"). This task applies the
+same fix to `litellm`.
 
-Add this line directly after the existing `"playwright>=1.40,<2",` entry (~line 27) in the core `dependencies` list:
+- [ ] **Step 1: Add both dependencies to `pyproject.toml`'s core list**
+
+Add these two lines directly after the existing `"playwright>=1.40,<2",` entry (~line 27) in the core `dependencies` list:
 
 ```toml
     "browser-use>=0.13,<0.14",
+    "litellm>=1,<2",
 ```
 
-- [ ] **Step 2: Add the dependency to `requirements.txt`**
+- [ ] **Step 2: Turn the `litellm` extra into a back-compat alias**
 
-Add this line directly after the existing `playwright>=1.40,<2` line (~line 30):
+In `pyproject.toml`'s `[project.optional-dependencies]` block, replace:
+
+```toml
+# Only needed for a provider profile with api_mode=litellm. Kept out of the base
+# install because it is a large dependency serving one optional backend, but
+# declared so `pip install agent8088[litellm]` works instead of leaving the user
+# to discover the package name from a runtime error.
+litellm = ["litellm>=1,<2"]
+```
+
+with:
+
+```toml
+# litellm is now a core dependency above (browse_page's interactive
+# browsing needs it regardless of which provider the main agent loop uses).
+# Kept as an alias, like `browser` and `search` above, so
+# `pip install agent8088[litellm]` stays valid instead of erroring on an
+# unknown extra.
+litellm = ["litellm>=1,<2"]
+```
+
+- [ ] **Step 3: Add both dependencies to `requirements.txt`**
+
+Add these two lines directly after the existing `playwright>=1.40,<2` line (~line 30):
 
 ```
 browser-use>=0.13,<0.14
+litellm>=1,<2
 ```
 
-- [ ] **Step 3: Install and verify**
+Also check `requirements.txt` for a separate commented-out `litellm: litellm>=1,<2` extras line (there is one, documenting the `pip install -e ".[litellm]"` extra, mirroring the `pyproject.toml` extras comment) and update its comment the same way Step 2 did, so the two files stay consistent — it should no longer read as "only needed for one optional backend" once litellm is a core dependency.
+
+- [ ] **Step 4: Install and verify**
 
 Run: `pip install -e .`
-Then: `python -c "from browser_use import Agent, BrowserProfile, ProxySettings; print('ok')"`
+Then: `python -c "from browser_use import Agent, BrowserProfile, ProxySettings; import litellm; print('ok')"`
 Expected: prints `ok` with no import errors.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add pyproject.toml requirements.txt
-git commit -m "build: add browser-use as a core dependency"
+git commit -m "build: add browser-use, promote litellm to a core dependency"
 ```
 
 ---
