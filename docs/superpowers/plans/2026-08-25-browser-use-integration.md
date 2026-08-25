@@ -819,7 +819,7 @@ def _exec_browser(args: dict) -> str:
 
 Also add `import asyncio` near the top of `engine.py`'s import block if it is not already imported (check first: `grep -n "^import asyncio" src/agent8088/engine.py`).
 
-Note the duplicated `def _playwright_available()` above is intentional-looking but is NOT a new function — it is the existing one, included here only so the replacement block is contiguous and copy-pasteable; when editing, keep the original `_playwright_available` where it already is and do not duplicate it. Only `BROWSER_TIMEOUT_MS`'s replacement (the two new constants), `_run_browser_agent` (new), and `_exec_browser`'s body actually change.
+The `_playwright_available()` function in that block is reproduced verbatim, unchanged, from the original file — it just happens to fall inside the 3400-3486 line range being replaced (it originally sits between `BROWSER_TIMEOUT_MS` and `_exec_browser`). It is not a new or second copy; the file should end up with exactly one `_playwright_available` definition, in the same place it is today. The parts that actually change are: `BROWSER_TIMEOUT_MS`'s replacement (the two new constants), the new `_run_browser_agent` function, and `_exec_browser`'s body.
 
 - [ ] **Step 4: Rewrite the second existing Chromium test that no longer matches the new implementation**
 
