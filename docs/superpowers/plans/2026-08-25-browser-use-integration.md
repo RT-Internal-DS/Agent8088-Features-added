@@ -29,7 +29,7 @@
 - Modify: `requirements.txt` (near the existing `playwright>=1.40,<2` line, ~line 30)
 
 **Interfaces:**
-- Produces: the `browser_use` and `litellm` packages importable in the venv used by later tasks (`import browser_use`, `import litellm`, and `from browser_use import Agent, BrowserProfile, ProxySettings` all succeed).
+- Produces: the `browser_use` and `litellm` packages importable in the venv used by later tasks (`import browser_use`, `import litellm`, `from browser_use import Agent, BrowserProfile`, and `from browser_use.browser import ProxySettings` all succeed — `ProxySettings` is not re-exported from the top-level `browser_use` package in 0.13.8, unlike `Agent`/`BrowserProfile`).
 
 **Ruling carried into this task (recorded during plan setup):** `litellm` is
 currently an *optional* extra (`pip install agent8088[litellm]`, only meant
@@ -93,7 +93,7 @@ Also check `requirements.txt` for a separate commented-out `litellm: litellm>=1,
 - [ ] **Step 4: Install and verify**
 
 Run: `pip install -e .`
-Then: `python -c "from browser_use import Agent, BrowserProfile, ProxySettings; import litellm; print('ok')"`
+Then: `python -c "from browser_use import Agent, BrowserProfile; from browser_use.browser import ProxySettings; import litellm; print('ok')"`
 Expected: prints `ok` with no import errors.
 
 - [ ] **Step 5: Commit**
@@ -724,7 +724,8 @@ async def _run_browser_agent(url: str, task: str) -> str:
     Agent8088ChatModel (browser_llm.py), so a multi-step task can't spend
     tokens outside the user's existing budget ceiling.
     """
-    from browser_use import Agent, BrowserProfile, ProxySettings
+    from browser_use import Agent, BrowserProfile
+    from browser_use.browser import ProxySettings
     from agent8088.browser_llm import build_browser_chat_model
     from agent8088.browser_proxy import start_ssrf_filtering_proxy
 
