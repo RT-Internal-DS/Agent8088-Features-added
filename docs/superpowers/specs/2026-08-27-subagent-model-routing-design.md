@@ -1,7 +1,15 @@
 # Subagent Model Routing & Dynamic Markdown Specification
 
 **Date:** 2026-08-27  
-**Status:** Approved  
+**Status:** SUPERSEDED (2026-08-28)  
+
+> **Superseded.** The `MODEL_TIERS` table below was an *illustrative example*, but was
+> implemented literally. Tier aliases (`haiku`/`flash`/`pro`/`sonnet`/`opus`) and
+> cross-provider `provider:model` routing have since been removed. Subagents now run on the
+> **active provider only**; a `model:` in frontmatter must be a real model ID that provider
+> offers, and anything else falls back to the session model with a warning. See
+> `2026-08-28-subagent-model-routing-redesign.md`.
+
 
 ## 1. Problem & Objectives
 

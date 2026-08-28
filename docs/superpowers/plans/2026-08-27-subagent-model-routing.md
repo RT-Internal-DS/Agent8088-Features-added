@@ -1,5 +1,11 @@
 # Subagent Model Routing & Dynamic Markdown Implementation Plan
 
+> **SUPERSEDED (2026-08-28).** This plan was executed, but Task 1's `MODEL_TIERS` table was
+> only ever an example in the design doc and should not have been implemented. Tiers and
+> cross-provider routing have been removed; see
+> `docs/superpowers/specs/2026-08-28-subagent-model-routing-redesign.md`.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Enable Claude Code-style subagent model routing and dynamic markdown subagent management in Agent8088, allowing subagents to specify model tiers (`haiku`, `flash`, `pro`) or exact model IDs in their YAML frontmatter, dynamically creating subagents via chat, and executing them on isolated scoped clients.
