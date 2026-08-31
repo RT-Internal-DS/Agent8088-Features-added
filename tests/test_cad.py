@@ -178,30 +178,6 @@ def test_invalid_build123d_location_failure_includes_exact_repair_syntax():
     assert "Location(x, y, z)" in result
 
 
-def test_primitive_input_validation_never_needs_the_runtime(tmp_path):
-    assert "Unknown shape" in cad.create_cad_part(tmp_path / "x.step", "torus", "10x5")
-    assert "Supported output formats" in cad.create_cad_part(tmp_path / "x.docx", "box", "1x2x3")
-    assert "needs 3" in cad.create_cad_part(tmp_path / "x.step", "box", "1x2")
-    assert "not a number" in cad.create_cad_part(tmp_path / "x.step", "box", "1xbrokex3")
-    assert "inner radius" in cad.create_cad_part(tmp_path / "x.step", "tube", "10x12x20")
-
-
-def test_primitive_key_value_dimensions_and_artifact_contract(monkeypatch, tmp_path):
-    seen = {}
-
-    def worker(request, timeout):
-        seen.update(request)
-        (tmp_path / "cylinder.step").write_bytes(b"verified step")
-        return _ok_result()
-
-    monkeypatch.setattr(cad, "_run_worker", worker)
-    result = cad.create_cad_part(
-        tmp_path / "cylinder.step", "cylinder", "radius=10,height=50"
-    )
-    assert seen["dimensions"] == {"radius": 10.0, "height": 50.0}
-    assert "Created cylinder.step" in result
-
-
 def test_generate_requires_step_source_and_parameter_object(tmp_path):
     source = "from build123d import Box\ndef gen_step():\n    return Box(1, 2, 3)"
     assert "requires a .step" in cad.generate_cad_model(tmp_path / "x.stl", source)
@@ -249,38 +225,6 @@ def test_generate_success_returns_complete_bundle(monkeypatch, tmp_path):
     assert not obsolete.exists()
 
 
-def test_declarative_design_requires_json_object(tmp_path):
-    assert "valid JSON" in cad.generate_cad_design(tmp_path / "x.step", "{")
-    assert "JSON object" in cad.generate_cad_design(tmp_path / "x.step", "[]")
-    assert "requires a .step" in cad.generate_cad_design(tmp_path / "x.stl", "{}")
-
-
-def test_declarative_design_writes_inputs_and_requires_bundle(monkeypatch, tmp_path):
-    design = {
-        "schema_version": 1, "units": "mm", "parameters": {"x": 5},
-        "components": [{"name": "body", "add": [{"type": "box", "size": ["x", 2, 3]}]}],
-    }
-
-    def complete(request, timeout):
-        for key in ("output", "report", "preview"):
-            Path(request[key]).write_bytes(b"artifact")
-        Path(request["output"]).with_suffix(".stl").write_bytes(b"mesh")
-        return {**_ok_result(), "component_count": 1, "assembly_interference": {
-            "checked": True, "pair_count": 0, "interferences": [],
-        }}
-
-    monkeypatch.setattr(cad, "_run_worker", complete)
-    model = tmp_path / "model.step"
-    obsolete = model.with_suffix(".step.py")
-    obsolete.write_text("stale advanced recipe")
-    result = cad.generate_cad_design(model, json.dumps(design), "step,stl")
-    assert "Generated and verified model.step" in result
-    assert json.loads(model.with_suffix(".design.json").read_text()) == design
-    assert json.loads(model.with_suffix(".params.json").read_text()) == {"x": 5}
-    assert "Named components: 1" in result
-    assert not obsolete.exists()
-
-
 def test_declarative_expression_language_is_bounded():
     params = {"length": 80, "half": "length / 2"}
     assert cad_worker._expression_value("half + 5", params) == 45.0
@@ -296,7 +240,7 @@ def test_declarative_expression_reports_parameter_cycles():
         cad_worker._expression_value("a", {"a": "b", "b": "a"}, ("root",))
 
 
-def test_design_verification_checks_request_dimensions_and_named_components():
+def test_verification_checks_request_dimensions_and_named_components():
     result = {
         "solid_count": 1,
         "bounding_box": {"min": [0, 0, 0], "max": [80, 50, 8], "size": [80, 50, 8]},
@@ -317,51 +261,38 @@ def test_design_verification_checks_request_dimensions_and_named_components():
             "solid_count": 1, "bounding_box": {"max": [80, 50, 8]},
         }},
     }}
-    verification = cad_worker._verify_design_expectations(
-        design, result, components, {},
+    verification = cad_worker._verify_geometry_expectations(
+        design["verification"], result, components, {}, component_checks=True,
     )
     assert verification["provided"] is True
     assert verification["ok"] is True
     assert len(verification["checks"]) == 5
 
 
-def test_design_verification_returns_actionable_mismatch():
+def test_verification_returns_actionable_mismatch():
     result = {
         "solid_count": 1,
         "bounding_box": {"min": [0, 0, 0], "max": [79, 50, 8], "size": [79, 50, 8]},
     }
-    verification = cad_worker._verify_design_expectations(
-        {"verification": {
-            "tolerance": 0.05,
-            "overall_bounding_box": {"size": [80, 50, 8]},
-        }},
-        result, {}, {},
+    verification = cad_worker._verify_geometry_expectations(
+        {"tolerance": 0.05, "overall_bounding_box": {"size": [80, 50, 8]}},
+        result, {}, {}, component_checks=False,
     )
     assert verification["ok"] is False
     assert verification["failures"][0]["name"] == "overall_bounding_box.size"
 
 
-def test_design_verification_rejects_empty_or_unknown_checks():
+def test_verification_rejects_empty_or_unknown_checks():
     overall = {
         "solid_count": 1,
         "bounding_box": {"min": [0, 0, 0], "max": [1, 1, 1], "size": [1, 1, 1]},
     }
     with pytest.raises(ValueError, match="at least one geometry check"):
-        cad_worker._verify_design_expectations({"verification": {}}, overall, {}, {})
+        cad_worker._verify_geometry_expectations(
+            {}, overall, {}, {}, component_checks=False)
     with pytest.raises(ValueError, match="unsupported field"):
-        cad_worker._verify_design_expectations(
-            {"verification": {"overall_size": [1, 1, 1]}}, overall, {}, {},
-        )
-
-
-def test_declarative_design_cannot_disable_interference_validation():
-    with pytest.raises(ValueError, match="always rejects"):
-        cad_worker._build_design({
-            "schema_version": 1, "units": "mm", "interference_policy": "report",
-            "components": [{
-                "name": "body", "add": [{"type": "box", "size": [1, 1, 1]}],
-            }],
-        })
+        cad_worker._verify_geometry_expectations(
+            {"overall_size": [1, 1, 1]}, overall, {}, {}, component_checks=False)
 
 
 def test_validate_requires_report_and_preview(monkeypatch, tmp_path):
@@ -485,12 +416,3 @@ def test_worker_rejects_paths_outside_the_authorized_workspace(tmp_path):
         assert "outside" in str(exc)
     else:
         raise AssertionError("out-of-workspace path was accepted")
-
-
-def test_worker_path_guard_includes_declarative_design(tmp_path):
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    with pytest.raises(ValueError, match="outside"):
-        cad_worker._require_workspace_paths({
-            "workspace": str(workspace), "design": str(tmp_path / "outside.design.json"),
-        })

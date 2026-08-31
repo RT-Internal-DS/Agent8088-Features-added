@@ -69,7 +69,7 @@ The installer provisions an isolated Python environment, installs the global `ag
 | Playwright Chromium (`browse_page`) | yes | yes |
 | Node.js 22 + WhatsApp bridge npm deps | yes | yes (portable, no admin) |
 | Native sandbox runtime | yes (auto-setup) | hint only — needs an elevated terminal |
-| Advanced CAD runtime + interactive Viewer (build123d + text-to-cad) | yes (isolated, optional) | yes (isolated, optional) |
+| Advanced CAD runtime + interactive Viewer (build123d-mcp + text-to-cad) | yes (isolated, optional) | yes (isolated, optional) |
 
 ### Supported platforms
 
@@ -151,30 +151,30 @@ and command guidance remain available without eagerly expanding the prompt.
 
 ### Verified CAD generation *(experimental)*
 
-Agent8088's built-in CAD path uses [build123d](https://github.com/gumyr/build123d)
-for OpenCascade geometry and the pinned
+Agent8088's built-in CAD path uses a supervised
+[build123d-mcp](https://github.com/pzfreo/build123d-mcp) session over
+[build123d](https://github.com/gumyr/build123d) for incremental OpenCascade
+geometry and the pinned
 [text-to-cad](https://github.com/earthtojake/text-to-cad) `cadgen` workflow for
 STEP-first generation, topology validation, and isometric preview rendering.
 The dependencies live in a dedicated environment under
 `integrations/cad/venv`, with a managed Python 3.11 interpreter, so they cannot
 change the core agent's Python packages or its supported Python version.
 
-Simple boxes, cylinders, spheres, cones, and tubes use a structured primitive
-tool. Individual parts use a bounded, natively structured design object that
-build123d compiles deterministically; advanced build123d Python remains a
-single-part escape hatch for fillets, chamfers, sketches, lofts, sweeps, shells,
-and other geometry outside that exact schema. Complex assemblies use a
-checkpointed project workflow: one component is generated and validated per
-model response, successful parts persist across retries, and a source-free
-placement specification produces the final assembly. This avoids requiring one
-model output to contain an entire robot, building, or mechanism. The worker validates each solid
-independently, rejects volumetric assembly overlap, and compares request-derived
-bounding-box, part-count, and named-component checks before reporting success.
-It requires a STEP model, report, and text-to-cad preview, bounds source and
-iteration complexity, and stops repeated failed generation attempts. STL, 3MF,
-GLB, and BREP are emitted only after the canonical STEP passes validation. This
-backend intentionally does not create native `.FCStd` feature trees; STEP is its
-canonical editable interchange format.
+Each request gets an owned MCP process and a persistent modelling namespace.
+The model adds one feature or component per call, then measures, inspects, and
+validates the real geometry before continuing. Agent8088 imposes outer timeouts,
+kills a wedged OpenCascade process, and replays only previously successful
+transactions. This avoids one response containing an entire robot, building,
+or mechanism and keeps work inside provider output limits.
+
+Final export saves canonical STEP, requested STL/3MF, editable parameters,
+replayable `gen_step()` source, reports, and a preview. The generated source is
+rebuilt in a clean constrained worker and the STEP is independently reopened by
+text-to-cad before success is reported. The MCP server remains in the isolated
+CAD environment because its MCP v2 and scientific dependencies never replace
+Agent8088's core packages. Native `.FCStd` feature trees are not created; STEP
+is the canonical editable interchange format.
 
 The same isolated installation includes text-to-cad's browser Viewer. Agent8088
 can open validated STEP/STP, STL, 3MF, GLB, and DXF artifacts for assembly-tree

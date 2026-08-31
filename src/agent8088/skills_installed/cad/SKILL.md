@@ -1,240 +1,159 @@
 ---
 name: cad
-description: Create, inspect, validate, render, and convert mechanical CAD with build123d and text-to-cad's STEP-first workflow.
+description: Build, verify, export, and visually review parametric mechanical CAD through Agent8088's supervised build123d-mcp and text-to-cad workflow.
 ---
 
 # CAD
 
-Agent8088 uses **build123d** as its geometry engine and **text-to-cad/cadgen**
-for STEP-first generation, named assemblies, topology validation, inspection,
-and snapshot review. Do not write FreeCAD Python and do not run CAD source with
-`execute_shell`.
+Agent8088 uses one CAD route:
 
-## Choose the deterministic tool first
+1. Agent8088 owns reasoning, permissions, timeouts, recovery, and artifacts.
+2. The isolated build123d-mcp server owns incremental build123d geometry state.
+3. text-to-cad independently reopens, validates, snapshots, and displays final artifacts.
 
-- One box, cylinder, sphere, cone, or tube: `create_cad_part`.
-- Convert an existing supported artifact: `convert_cad`.
-- Validate or render an existing STEP: `validate_cad_model`.
-- Open an existing or generated artifact for interactive visual review:
-  `open_cad_viewer`.
-- One part expressible with boxes, cylinders, spheres, cones, tubes,
-  placements, fusions and cuts: `generate_cad_design` (preferred).
-- One part requiring lofts, sweeps, sketches, selectors, or other advanced
-  build123d operations: `generate_cad_model` (escape hatch).
-- Every multi-component, movable, robotic, architectural, or otherwise complex
-  assembly: the checkpointed `cad_project_create`,
-  `cad_project_add_component`, and `cad_project_finalize` workflow below.
+Never generate CAD with `execute_shell`, `write_file`, `run_sandboxed`, or FreeCAD
+Python. There is no one-shot CAD generation tool to fall back on: the supervised
+session is the only route. Never claim success from an exit code.
 
-Both complex-model tools generate STEP, reopen and validate every solid
-independently, check bounded assembly interference, and render an isometric
-preview before reporting success. Secondary formats are emitted only after the
-canonical STEP passes those checks.
-`generate_cad_design` retains a type-checked `.design.json` plus parameters and
-does not execute model-authored Python, so use it whenever its schema fits.
+## Required workflow
 
-After successful generation or modification, call `open_cad_viewer` with the
-canonical STEP unless the user explicitly declines interactive review. The PNG
-snapshot is deterministic evidence for automated verification; the Viewer is
-the human review surface for assembly trees, selection, measurement, clipping,
-exploded layouts, and annotations. Neither replaces topology/interference checks.
+1. Convert the request into editable parameters and measurable requirements.
+2. Call `cad_begin` once with a short artifact-directory name.
+3. Call `cad_execute` with one coherent feature or component only. Wait for its result.
+4. Register meaningful geometry with `show(shape, "StableName")`.
+5. Call `cad_measure` after every boolean operation.
+6. Save `cad_snapshot` before risky fillets, shells, lofts, or complex booleans.
+7. Repeat one tool call per model response until construction is complete.
+8. Call `cad_inspect` with request-derived expectations.
+9. Call `cad_validate`. Repair any failure; never weaken the requested checks.
+10. Call `cad_render` for an isometric preview.
+11. Call `cad_export` for STEP and requested secondary formats. This saves source,
+    parameters, reports, and preview, then independently reopens the STEP through
+    text-to-cad.
+12. Call `open_cad_viewer` on the exported STEP unless the user declined visual review.
 
-## CAD brief before source
+`cad_export` is the only successful completion path for generated CAD.
 
-Before calling the tool, establish internally:
+## Correct build123d patterns
 
-1. Units (millimetres unless explicitly stated otherwise).
-2. Primary axes and origin. Honour an axis the user specified.
-3. Named components and expected solid count.
-4. Exposed parameters and derived dimensions.
-5. Fits, clearances, wall thicknesses, and tolerances.
-6. Expected overall bounding-box range.
-7. Required formats.
-
-Do not ask a question when the user explicitly asked you to make reasonable
-engineering assumptions. Record those assumptions in the final response.
-
-## Declarative design contract (preferred)
-
-Use a bare filename such as `house.step`; Agent8088 resolves it to its artifacts
-directory. Never guess `C:/artifacts`, call a shell to discover the current
-directory, or write a separate script.
-
-The tool receives `design` as a structured object (not JSON text embedded inside
-another string). The schema has millimetre units, editable parameters, uniquely
-named components, and request-derived verification checks. Each component fuses
-its `add` primitives, then applies its `cut` primitives. Numeric fields may be
-arithmetic expressions referencing parameters. Every primitive supports `at`,
-`rotate`, and a compact `placements` array. Unknown or misspelled fields are
-rejected rather than silently ignored.
-
-```json
-{
-  "schema_version": 1,
-  "name": "bracket",
-  "units": "mm",
-  "parameters": {"length": 80, "width": 50, "height": 8, "hole_r": 3.4},
-  "components": [{
-    "name": "plate",
-    "add": [{"type": "box", "size": ["length", "width", "height"]}],
-    "cut": [{
-      "type": "cylinder", "radius": "hole_r", "height": "height + 2",
-      "at": [15, 15, -1], "placements": [[0, 0, 0], [50, 0, 0]]
-    }]
-  }],
-  "verification": {
-    "tolerance": 0.05,
-    "overall_bounding_box": {"size": ["length", "width", "height"]},
-    "solid_count": 1,
-    "component_count": 1,
-    "components": {
-      "plate": {
-        "solid_count": 1,
-        "bounding_box": {"size": ["length", "width", "height"]}
-      }
-    }
-  }
-}
-```
-
-Primitive-specific fields are: box `size`; cylinder `radius,height`; sphere
-`radius`; cone `radius1,radius2,height`; tube
-`outer_radius,inner_radius,height`. Use separate named components when the user
-wants separate solids. Avoid overlapping solids; exact touching faces are valid
-mating contact and are not misclassified as self-intersection.
-
-`verification` is mandatory in model-visible tool calls. Derive it from the
-user's brief; never invent a looser target merely to make a build pass. It may
-check the overall `size`, `min`, and/or `max`, exact total solid/component counts,
-and the same bounding-box/solid-count facts for named components. A mismatch is
-a retryable generation failure, and secondary exports are withheld until the
-canonical STEP matches.
-
-## Python source contract (advanced escape hatch)
-
-Pass a `.step` filename, a structured parameter object, request-derived
-`verification`, and Python source defining exactly one entry point:
+The MCP execute environment already exposes build123d. These are valid patterns:
 
 ```python
 from build123d import *
 
-def gen_step():
-    body = Box(PARAMS["length"], PARAMS["width"], PARAMS["height"])
-    body.label = "body"
-    return body
+profile = RegularPolygon(PARAMS["radius"], 6) - Circle(PARAMS["bore"])
+spacer = extrude(profile, PARAMS["height"])
+show(spacer, "Spacer")
 ```
 
-The tool injects `PARAMS` from the provided JSON. Never redefine it. `gen_step`
-takes no arguments and returns a build123d `Shape` or a labeled `Compound`.
-Advanced-model verification supports expected overall bounding-box `size`,
-`min`, and `max`, an absolute tolerance, and total solid count. Secondary
-exports are withheld if the generated STEP misses those targets.
+Use:
 
-Keep the single-part generator compact. Use small helper functions and loops for repeated
-features such as windows, holes, columns, fasteners, or floor elements instead
-of emitting nearly identical construction statements for every instance. Never
-put a complete assembly in one `generate_cad_model` call.
+- `RegularPolygon`, not an invented `Hexagon` helper.
+- `Vector`, not `Vec`.
+- `extrude(profile, amount)`, not a CadQuery-style `.extrude()` guess.
+- `Pos(x, y, z) * shape` for translation, `Rot(rx, ry, rz) * shape` for rotation.
+- `PolarLocations(radius, count) * feature` for a bolt circle or radial pattern.
+- `PARAMS["name"]` for every dimension, so the design stays editable.
 
-Allowed imports are build123d, math, dataclasses, and typing. File IO,
-network access, process execution, dynamic imports, private/dunder access, and
-calls such as `open`, `eval`, or `exec` are rejected. The tool owns every export;
-the generator only constructs and returns geometry.
+Prefer simple, inspectable construction steps. Reuse variables already present in
+the persistent session rather than resending prior code.
 
-## Modeling order
+`cad_execute` blocks must **build geometry only**. Read the model with the
+`cad_measure`, `cad_inspect`, `cad_validate`, and `cad_compare` tools instead of
+`print(...)` or the server's in-namespace analysis helpers (`measure`,
+`find_holes`, `clearance`, ...). Bare analysis calls are stripped from the
+exported source; a value taken from one makes the design unreplayable outside
+the live session and downgrades the strict export gate.
 
-Use this order unless the geometry requires otherwise:
+## Measuring and checking
 
-1. Base solids.
-2. Major additions and fusions.
-3. Major subtractions and holes.
-4. Shells and wall thickness.
-5. Repeated features.
-6. Fillets and chamfers last.
-7. Component placement and labeled compound assembly.
+- `cad_measure` reports volume, area, bounding box, centre of mass, and
+  face/edge/vertex counts. It does **not** report a solid count.
+- `cad_validate` reports `n_solids` plus watertight/manifold/B-rep status.
+- `cad_inspect` compares the model to expectations. Its `expected` object accepts
+  only these keys:
+  - `bbox` — a 3-number `[x, y, z]` array in mm, or an object with any of
+    `x`, `y`, `z`
+  - `solid_count` — integer
+  - `holes` — array of `{count, axis, diameter, depth, bottom, cbore, spotface}`
+  - `bosses` — array of `{count, axis, diameter, height}`
+  - `patterns` — array
+  - `section_varying` — boolean
+  - `tolerance` — mm, default `0.1`
 
-Apply realistic slip-fit clearance explicitly rather than relying on coincident
-surfaces. Avoid tangential booleans; extend cutting tools beyond the target.
-Remember that build123d primitives are centered on some axes by default. Set
-`align=(Align.MIN, Align.MIN, Align.MIN)` when dimensions and positions are
-specified from a lower-corner datum; do not compensate later for an accidental
-centered origin. Translate geometry with `Pos(x, y, z) * shape`. If a full
-`Location` is required, its position is one tuple: `Location((x, y, z))`.
-`Location(x, y, z)` and `Location(z=value)` are invalid build123d calls.
+  Anything else is rejected. Write `{"bbox": [120, 120, 32], "solid_count": 1}`,
+  never `{"bounding_box_mm": ...}` with invented sibling keys. `axis` and
+  `direction` may be written as `"Z"`/`"-Z"` or as `[0, 0, 1]`.
 
-## Assemblies
+  `holes`, `bosses`, and `patterns` expectations are **exhaustive**: every
+  recognised group must match one expectation, and one expectation must not match
+  two distinct groups. A part with five lightening holes *and* a central bore
+  needs both declared, with a distinguishing `diameter` or `depth` on each. When
+  you only want dimensions checked, use `bbox` and `solid_count` and read the
+  feature inventory from a plain `cad_inspect` call with no `expected`.
 
-Complex assemblies are persistent projects, not one model response:
+Remember that `Box`, `Cylinder`, and `Sphere` are centred on the origin while
+`extrude()` grows from the sketch plane. Mixing them without an explicit `Pos`
+shifts the part; `cad_inspect` with a `bbox` expectation is what catches it.
 
-1. Call `cad_project_create` once with a `.cadproject.json` manifest, shared
-   parameters, requested output formats, and final request-derived checks.
-2. Call `cad_project_add_component` for exactly one named component and stop.
-   Wait for the tool to build, reopen, validate, render, and checkpoint that
-   component before authoring the next one. Source defines one `gen_step()` part.
-3. Repeat step 2 one component per response. If a component fails, repair only
-   that component with the same name; completed components are reused.
-4. Call `cad_project_finalize` with a compact `occurrences` array containing
-   unique occurrence names, component names, and optional `at`/`rotate` vectors.
-   The finalizer accepts no generated Python.
-5. Open the verified STEP with `open_cad_viewer`.
+## Multi-component designs
 
-Call `cad_project_status` before resuming interrupted work. Do not issue multiple
-project calls in one response: later calls would have been authored without the
-previous validation result. The final worker reloads the validated component
-STEP files, applies bounded transforms, rejects volumetric interference, checks
-the full request, emits secondary formats only after success, and preserves the
-manifest for deterministic resume.
+Build and `show()` each component under a stable name. Measure parts after
+construction and use `cad_compare(kind="fit")` for clearances or unintended
+interference.
 
-## Validation and repair
+Export an assembly with `cad_export(object_name="*")`: every registered object is
+validated individually and the STEP contains all of them. Because `*` means
+*everything currently registered*, do not leave scratch geometry under a `show()`
+name — either give the intermediate a throwaway variable and no `show()`, or
+overwrite the name once the final version exists.
 
-Success requires all requested files plus a report and preview. Pay attention to
-the returned bounding box, solid count, volume, and validity findings.
+Do not write an entire robot, house, telescope, or assembly in one tool call.
+Large requests must be decomposed into feature clusters so model output stays well
+below its completion limit and every operation is based on real prior results.
 
-When generation fails, repair the named field or component once. Agent8088 stops
-after two failed generation attempts in one turn instead of spending the whole
-time/token budget on variants.
+## Editing an existing model
 
-- Invalid design/expression: correct only the named schema field.
-- Boolean failure: enlarge or offset the tool so faces cross instead of touch.
-- Fillet failure: reduce the radius or filter the exact intended edges.
-- Loft failure: use compatible profiles and consistent orientation.
-- Wrong placement: correct the local coordinate frame rather than adding a
-  compensating transform at the end.
-- Wrong solid count: inspect whether parts were accidentally fused or omitted.
-- Wrong axis: repair the source; do not merely rotate the preview.
+`cad_import` copies the file into the session workspace, registers it, and binds
+it to a session variable named after it. Use that variable directly:
 
-Never claim success from a Python exit code. The CAD tools make disk artifacts,
-reopen them, validate BREP topology, and render a snapshot; report their actual
-result.
+```python
+edited = drive_flange - Pos(0, 0, 0) * Box(200, PARAMS["slot_w"], 6)
+show(edited, "Edited")
+```
 
-## Interactive visual verification
+Imported geometry cannot be rebuilt from parameters alone, so such a session is
+gated by the clean-process replay rather than the constrained source replay. The
+report says which gate ran.
 
-Use the managed Viewer only through `open_cad_viewer`; never start its Python
-server, Node tooling, or a browser from generated code. It binds to loopback and
-opens only the authorized artifact directory. For STEP, verify labels and part
-structure in the assembly tree, hide/show major components, inspect an exploded
-layout, and use clipping where internal clearances matter. Mesh measurements are
-vertex-based approximations; use STEP geometry/report values for authoritative
-dimensions. If the Viewer cannot start, preserve and report the verified STEP,
-JSON report, and PNG rather than regenerating otherwise valid geometry.
+## Failures and recovery
 
-## Outputs
+After a failed `cad_execute`:
 
-STEP is the canonical portable CAD artifact. Supported secondary outputs are
-STL, 3MF, GLB, and BREP. Native `.FCStd` feature-tree output is not
-provided by this backend. If requested, explain that the validated STEP can be
-opened in FreeCAD but is not a native PartDesign history.
+1. Call `cad_last_error` immediately.
+2. Correct the named line or feature only.
+3. Use `cad_restore` if the previous known-good snapshot is needed.
+4. Retry once with a smaller block.
 
-The normal advanced-model bundle contains:
+A failed block is never committed, so it is never replayed. `cad_restore` also
+rewinds the replayable history to that checkpoint, which means the exported
+source always matches the geometry you kept.
 
-- `<name>.design.json` - retained declarative design (preferred workflow), or
-  `<name>.step.py` - retained parametric build123d source (advanced workflow).
-- `<name>.params.json` — exposed parameters.
-- `<name>.step` — canonical BREP model.
-- `<name>.preview.png` — deterministic isometric review image.
-- `<name>.report.json` — dimensions and validity evidence.
-- Requested secondary exports.
+The supervised runtime kills and restarts a wedged server and replays only
+previously successful blocks. Do not blindly repeat a timed-out operation.
 
-## Upstream basis
+## Output contract
 
-The workflow is adapted from earthtojake/text-to-cad's CAD skill and pinned
-cadgen runtime. Geometry is produced by gumyr/build123d. Their license and
-version notices ship with Agent8088's CAD runtime assets.
+`cad_export` publishes nothing until every gate passes. It stages the files, then
+requires: the MCP validity gate on each exported object, a clean-process rebuild
+of the recorded operations whose geometry matches the live session exactly, a
+replay of the generated `gen_step()` source where the constrained generator can
+run it, and an independent text-to-cad reopen of the STEP.
+
+The published bundle is canonical STEP, the requested STL/3MF, the generated
+`<design>.step.py` source, the committed `<design>.cad.py` transaction log,
+`<design>.params.json`, `<design>.report.json`, `<design>.mcp-report.json`, and a
+PNG preview. STEP is the canonical portable B-rep. STL is a tessellated
+manufacturing/printing derivative, not the editable source of truth.
+
+All dimensions are millimetres unless the user explicitly states otherwise.

@@ -327,7 +327,15 @@ expected_tools = {
     "create_document": "write_text",
     "convert_document": "write_text",
     "convert_cad": "write_text",
-    "create_cad_part": "write_text",
+    "validate_cad_model": "write_text",
+    "create_subagent": "write_text",
+    "open_cad_viewer": "read_text",
+    # The supervised build123d-mcp session: the only CAD modelling route.
+    "cad_begin": "cad_mcp", "cad_execute": "cad_mcp", "cad_state": "cad_mcp",
+    "cad_measure": "cad_mcp", "cad_inspect": "cad_mcp", "cad_validate": "cad_mcp",
+    "cad_render": "cad_mcp", "cad_snapshot": "cad_mcp", "cad_restore": "cad_mcp",
+    "cad_compare": "cad_mcp", "cad_import": "cad_mcp", "cad_last_error": "cad_mcp",
+    "cad_export": "cad_mcp",
 }
 ok(f"exactly the expected {len(expected_tools)} tools", set(E.TOOL_NAMES) == set(expected_tools),
    str(set(E.TOOL_NAMES) ^ set(expected_tools)) if set(E.TOOL_NAMES) != set(expected_tools) else "")

@@ -15,9 +15,11 @@ def test_windows_installer_uses_a_dedicated_runtime_not_freecad():
     assert "FreeCAD.FreeCAD" not in INSTALLER
 
 
-def test_windows_installer_pins_both_engines_and_smoke_tests_geometry():
+def test_windows_installer_pins_mcp_geometry_and_viewer_and_smoke_tests_protocol():
     requirements = (ROOT / "src/agent8088/cad_runtime_requirements.txt").read_text()
     assert "build123d==0.11.1" in requirements
+    assert "build123d-mcp==0.3.83" in requirements
+    assert "cadquery-ocp-novtk!=7.9.3.1.1" in requirements
     assert "cadgen==0.4.28" in requirements
     assert "cad_runtime_requirements.txt" in INSTALLER
     assert '@("python", "install", "3.11")' in INSTALLER
@@ -28,6 +30,7 @@ def test_windows_installer_pins_both_engines_and_smoke_tests_geometry():
     assert '"--viewer-root", $viewerRoot' in INSTALLER
     assert '@("-m", "playwright", "install", "chromium")' in INSTALLER
     assert "STEP, preview, and Viewer round-trip smoke test" in INSTALLER
+    assert "Verifying supervised CAD MCP" in INSTALLER
 
 
 def test_windows_cad_failure_is_optional_and_actionable():
@@ -44,7 +47,7 @@ def test_linux_installer_has_the_same_optional_runtime_contract():
     assert '"$_root/venv"' in section
     assert "cad_runtime_requirements.txt" in section
     assert "warn_stage" in section
-    assert "build123d" in section and "cadgen" in section
+    assert "build123d-mcp" in section and "build123d" in section and "cadgen" in section
     assert "python install 3.11" in section
     assert "venv --python 3.11" in section
     assert '"$_py" -m playwright install chromium' in section

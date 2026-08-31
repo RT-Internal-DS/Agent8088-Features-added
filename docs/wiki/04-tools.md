@@ -46,13 +46,18 @@ is what the permission layer gates on — see
 | `cli_anything_skill` | `cli_anything` | `name` | ✅ | Load an installed harness's packaged task guidance. |
 | `cli_anything_run` | `cli_anything` | `name`, `arguments`, `cwd` | prompt | Run an installed harness with structured argv and no shell interpolation. |
 | `convert_cad` | `write_text` | `filename`, `format` | prompt | Convert a supported solid CAD file through the isolated build123d runtime. |
-| `create_cad_part` | `write_text` | `filename`, `shape`, `dimensions` | prompt | Build a box/cylinder/sphere/cone/tube from dimensions. No code needed. |
-| `generate_cad_design` | `write_text` | `filename`, `design`, `formats` | prompt | Compile bounded declarative JSON to a validated STEP-first model and preview. |
-| `generate_cad_model` | `write_text` | `filename`, `source`, `parameters`, `formats` | prompt | Generate a parameterized STEP-first model, validate it, and render a preview. |
-| `cad_project_create` | `write_text` | `filename`, `name`, `parameters`, `verification`, `formats` | prompt | Start or safely resume a checkpointed complex-assembly project. |
-| `cad_project_add_component` | `write_text` | `filename`, `name`, `source`, `parameters`, `verification` | prompt | Generate, reopen, validate, and checkpoint exactly one component. |
-| `cad_project_finalize` | `write_text` | `filename`, `assembly`, `formats` | prompt | Assemble validated components from bounded placements and verify the result. |
-| `cad_project_status` | `read_text` | `filename` | ✅ | Read compact project progress without loading component source. |
+| `cad_begin` | `cad_mcp` | `project`, `name`, `parameters`, `requirements` | prompt | Start an owned, supervised build123d-mcp session. |
+| `cad_execute` | `cad_mcp` | `code`, `checkpoint` | prompt | Add one bounded feature or component to persistent CAD state. |
+| `cad_state` | `cad_mcp` | — | ✅ | Read named objects, variables, snapshots, and current geometry. |
+| `cad_measure` | `cad_mcp` | `object_name`, `material` | ✅ | Measure exact volume, topology, face inventory, mass, and bounding box. |
+| `cad_inspect` | `cad_mcp` | `object_name`, `expected` | ✅ | Inventory features and compare request-derived expectations (`bbox`, `solid_count`, `holes`, `bosses`, `patterns`, `section_varying`, `tolerance`; `axis` accepts `"Z"` or `[0,0,1]`; feature-group expectations are exhaustive). |
+| `cad_validate` | `cad_mcp` | `object_name` | ✅ | Run the watertight/manifold/B-rep validity gate. |
+| `cad_render` | `cad_mcp` | `object_names`, `direction` | prompt | Save a labelled high-quality preview inside the active workspace. |
+| `cad_snapshot` / `cad_restore` | `cad_mcp` | `name` | prompt | Checkpoint or restore known-good geometry. |
+| `cad_compare` | `cad_mcp` | `a`, `b`, `kind` | ✅ | Compare shapes, fit, alignment, or snapshots. |
+| `cad_import` | `cad_mcp` | `filename`, `name` | prompt | Import STEP/STL/3MF after sensitive-path checks and bind it to a session variable. |
+| `cad_last_error` | `cad_mcp` | — | ✅ | Return the exact failed line and repair context. |
+| `cad_export` | `cad_mcp` | `filename`, `formats`, `object_name` | prompt | Export, replay source, independently validate, and produce the final bundle. |
 | `validate_cad_model` | `write_text` | `filename`, `render` | prompt | Reopen and validate a STEP model and optionally render an isometric preview. |
 | `open_cad_viewer` | `read_text` | `filename`, `open_browser` | âœ… | Open a supported artifact in the managed loopback text-to-cad Viewer. |
 
@@ -88,35 +93,51 @@ Reading is automatic for STEP, BREP, and STL. The isolated CAD worker reopens
 the artifact and reports its bounding box, solid count, volume, and topology
 validity rather than interpreting it as text.
 
-`create_cad_part` is the structured, no-code path for one box, cylinder, sphere,
-cone, or tube. `generate_cad_design` is preferred for individual parts: it
-receives a native structured object and compiles a bounded,
-type-checked schema with parameters, named components, placements, fusions,
-cuts, and request-derived dimensional checks. `generate_cad_model` remains the
-single-part Python escape hatch for build123d operations outside that exact schema.
-Multi-component, robotic, architectural, movable, and otherwise complex
-assemblies use `cad_project_create`, then exactly one
-`cad_project_add_component` per model response, followed by
-`cad_project_finalize`. Component STEP files and validation reports are
-checkpointed, so an output cutoff or failed part repairs only that part instead
-of discarding the whole design. Finalization accepts placements rather than
-generated source, reloads every verified component, and independently checks
-the completed assembly. `cad_project_status` makes interrupted work resumable.
-text-to-cad/cadgen supplies STEP-first generation/export, per-solid topology
-validation, and preview rendering in both workflows. Volumetric assembly
-overlap is rejected independently, while touching mating faces remain valid and
-are not mislabeled as a self-intersecting body. Secondary exports are withheld
-when the STEP misses a declared dimension/count or has interference. The tools
-retain design/source, parameters, STEP, report, preview, and verified
-STL/3MF/GLB/BREP exports. `validate_cad_model`
-can repeat the reopen, topology, interference, and render checks later.
+There is deliberately **no one-shot CAD generation tool**. `create_cad_part`,
+`generate_cad_design`, `generate_cad_model`, and the staged `cad_project_*`
+workflow were retired: several overlapping CAD routes was the documented cause of
+wrong tool selection and oversized single-response programs. The constrained
+`gen_step()` generator survives as an internal library — it is the clean-process
+replay that `cad_export` gates on — but it is not callable by the model.
+
+CAD generation uses one supervised route. `cad_begin` starts an isolated
+build123d-mcp process and seeds editable parameters. Subsequent `cad_execute`
+calls add one feature or component at a time to persistent geometry. Measurement,
+inspection, validation, snapshot, rollback, and comparison tools operate on that
+real state, so later model decisions use observed geometry instead of assumptions.
+
+Agent8088 owns the server process and applies a hard outer deadline. If
+OpenCascade hangs or crashes, the process tree is terminated, restarted, and
+only successful transactions are replayed. A failed transaction is never added
+to recovery history. The model sees a curated CAD surface rather than all
+upstream MCP tools, reducing schema and tool-selection noise.
+
+`cad_export` stages STEP and requested STL/3MF plus parameters, reports,
+transaction history, canonical `gen_step()` source, and a preview, and publishes
+them only after every gate passes: the validity gate on each exported object
+(`*` expands to every registered object, because upstream `validate` does not
+accept it), a rebuild of the recorded operations in a brand-new server process
+whose measured geometry must match the live session exactly, a rebuild of the
+canonical source in Agent8088's separate constrained worker where that worker's
+policy can run it, and an independent text-to-cad reopen of the STEP. A session
+built on imported geometry cannot be rebuilt from parameters alone, so its report
+records the constrained replay as not applicable and the clean-process replay
+carries the gate. Nothing is published when a gate fails. `validate_cad_model`
+can repeat the artifact-level checks later.
+
+`cad_restore` rewinds the session's replayable history to the checkpoint and
+rebuilds from it, because upstream `restore_snapshot` rewinds registered objects
+but not the execute namespace — without the rebuild the next `part = part - ...`
+would silently continue from the geometry that was just rolled back. A supervised
+restart re-creates each checkpoint at the point in history it was taken, so
+rollback still works after recovery.
 
 During a CAD-generation turn, generic shell and file-writing tools are removed
 from the model-visible tool set. The agent receives the real artifacts location,
-uses a bare output filename, and executes only one project checkpoint operation
-per model response. If a response reaches the provider's output ceiling, its
-unusable partial source is discarded and the retry is routed to the staged
-project workflow without pretending the model supports a larger limit. This
+uses a bare project name, and executes only one stateful CAD operation per model
+response. If a response reaches the provider's output ceiling, its unusable
+partial source is discarded and the retry returns to `cad_state` or `cad_begin`
+before continuing with smaller feature calls. This
 avoids shell path guessing, repeated approval loops, and unbounded source
 rewrites consuming the model's time or token budget.
 
@@ -130,7 +151,7 @@ prebuilt Viewer is installed from a commit- and checksum-pinned upstream
 archive; development/npm sources are not executed. STEP remains authoritative
 because measurements on triangulated formats snap to mesh vertices.
 
-Both upstream engines are pinned in a dedicated Python 3.11
+build123d, build123d-mcp, and text-to-cad are pinned in a dedicated Python 3.11
 `integrations/cad/venv` environment installed on a best-effort basis by both
 platform installers. The same stage installs and smoke-tests the pinned Viewer. A
 CAD-stage failure never blocks the core agent, and `/doctor` reports whether
@@ -141,11 +162,19 @@ PDF is deliberately **not** a `convert_cad` target. A useful 3D-to-PDF result
 requires a drawing definition (template, projection, dimensions, and scale),
 not a format conversion.
 
-All CAD write tools share `mode=write_text` for the same reason
-`create_document` does, and all are excluded from the plan auditor: they verify
-their own output on disk, while the auditor runs in a disposable sandbox copy
-that cannot see the real file, so auditing them yields verdicts from the
-auditor's own blindness.
+Mutating CAD MCP tools pass Agent8088's normal write approval and workspace
+policy, with approval scoped to one design: the first mutating call in a session
+asks, and the rest of that design's steps in the same workspace proceed. A new
+`cad_begin` or a new user turn asks again. The scope is safe to widen this far
+because the cad_* tools cannot run a shell, reach the network, or write outside
+the approved workspace. Read-only geometry queries do not prompt. Upstream tools
+that look read-only but accept a save path are not exposed directly; Agent8088
+supplies their paths internally from the active artifact workspace.
+
+A CAD request does not have to say "CAD": a mechanical design verb plus a
+mechanical noun or an explicit millimetre dimension also routes to the supervised
+session, so "design a robotic gripper" gets the same contract and the same
+bounded toolset as "generate a CAD bracket".
 
 > `git_status`/`git_diff`/`git_log` depend on the sandbox backend: allowed
 > without a prompt under the native sandbox, escalated under `local`, because

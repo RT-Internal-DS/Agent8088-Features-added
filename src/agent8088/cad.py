@@ -35,11 +35,11 @@ from .documents import _readable_or_reason
 
 MAX_CAD_BYTES = 200 * 1024 * 1024
 MAX_GENERATOR_BYTES = 256 * 1024
-MAX_DESIGN_BYTES = 256 * 1024
 MAX_VERIFICATION_BYTES = 64 * 1024
 
 CADGEN_VERSION = "0.4.28"
 BUILD123D_VERSION = "0.11.1"
+BUILD123D_MCP_VERSION = "0.3.83"
 CAD_VIEWER_VERSION = "0.4.28"
 CAD_VIEWER_COMMIT = "0e94cd1d2b5fa2013d89aa9504ecadcf16ce39f6"
 CAD_VIEWER_SHA256 = "8a349d4287407c79392e736c9d2e2d9c52e0427a58d168a4f325f926dfd7b7d1"
@@ -48,7 +48,6 @@ CAD_EXTENSIONS = (
     ".step", ".stp", ".stl", ".3mf", ".glb", ".brep",
 )
 CONVERTIBLE_CAD_TARGETS = ("step", "stl", "3mf", "glb", "brep")
-CAD_PRIMITIVES = ("box", "cylinder", "sphere", "cone", "tube")
 
 _RESULT_START = "AGENT8088_CAD_RESULT_START"
 _RESULT_END = "AGENT8088_CAD_RESULT_END"
@@ -128,6 +127,8 @@ def cad_runtime_status(timeout: int = 45) -> dict[str, Any]:
         "root": str(cad_runtime_root()),
         "cadgen": CADGEN_VERSION,
         "build123d": BUILD123D_VERSION,
+        "build123d_mcp": BUILD123D_MCP_VERSION,
+        "mcp_available": False,
         "viewer": cad_viewer_status(),
     }
     if not python.is_file():
@@ -135,8 +136,9 @@ def cad_runtime_status(timeout: int = 45) -> dict[str, Any]:
         return result
     code = (
         "from importlib.metadata import version; "
-        "import build123d, cadgen; "
-        "print(version('build123d') + '|' + version('cadgen'))"
+        "import build123d, cadgen, build123d_mcp; "
+        "print(version('build123d') + '|' + version('cadgen') + '|' + "
+        "version('build123d-mcp'))"
     )
     try:
         done = subprocess.run(
@@ -148,7 +150,9 @@ def cad_runtime_status(timeout: int = 45) -> dict[str, Any]:
         result["reason"] = f"runtime probe failed: {exc}"
         return result
     versions = (done.stdout or "").strip().split("|")
-    if done.returncode == 0 and versions == [BUILD123D_VERSION, CADGEN_VERSION]:
+    expected = [BUILD123D_VERSION, CADGEN_VERSION, BUILD123D_MCP_VERSION]
+    if done.returncode == 0 and versions == expected:
+        result["mcp_available"] = True
         result["available"] = bool(result["viewer"]["available"])
         result["installed_versions"] = versions
         if not result["available"]:
@@ -162,7 +166,8 @@ def cad_runtime_status(timeout: int = 45) -> dict[str, Any]:
 _NOT_INSTALLED_MESSAGE = (
     "Agent8088's advanced CAD runtime is not installed, so this CAD operation "
     "cannot run. Re-run the Agent8088 installer to install the pinned build123d "
-    f"{BUILD123D_VERSION} + text-to-cad cadgen {CADGEN_VERSION} runtime."
+    f"{BUILD123D_VERSION}, build123d-mcp {BUILD123D_MCP_VERSION}, and text-to-cad "
+    f"cadgen {CADGEN_VERSION} runtime."
 )
 
 
@@ -514,93 +519,6 @@ def convert_cad(path, target_format: str, timeout: int = 300) -> str:
     return f"Converted {path.name} to {output.name} ({output.stat().st_size} bytes).\n" + _format_metrics(result)
 
 
-def _parse_dimensions(shape: str, dimensions: str) -> dict[str, float]:
-    keys = {
-        "box": ("length", "width", "height"),
-        "cylinder": ("radius", "height"),
-        "sphere": ("radius",),
-        "cone": ("bottom_radius", "top_radius", "height"),
-        "tube": ("outer_radius", "inner_radius", "height"),
-    }[shape]
-    raw = (dimensions or "").strip().lower().replace(" ", "")
-    if "=" in raw:
-        aliases = {
-            "r": "radius", "l": "length", "w": "width", "h": "height",
-            "r1": "bottom_radius", "r2": "top_radius", "outer": "outer_radius",
-            "inner": "inner_radius", "od": "outer_diameter", "id": "inner_diameter",
-        }
-        parsed: dict[str, float] = {}
-        for pair in raw.split(","):
-            if "=" not in pair:
-                raise ValueError(f"Expected key=value but got '{pair}'.")
-            key, value = pair.split("=", 1)
-            key = aliases.get(key, key)
-            try:
-                parsed[key] = float(value)
-            except ValueError as exc:
-                raise ValueError(f"'{value}' is not a number.") from exc
-        if "outer_diameter" in parsed:
-            parsed["outer_radius"] = parsed["outer_diameter"] / 2
-        if "inner_diameter" in parsed:
-            parsed["inner_radius"] = parsed["inner_diameter"] / 2
-        missing = [key for key in keys if key not in parsed]
-        if missing:
-            raise ValueError("Missing dimension(s): " + ", ".join(missing) + ".")
-        result = {key: parsed[key] for key in keys}
-    else:
-        values = raw.replace("r", "")
-        parts = values.split("x") if values else []
-        if len(parts) != len(keys):
-            raise ValueError(f"{shape} needs {len(keys)} dimension value(s); got {len(parts)}.")
-        try:
-            result = dict(zip(keys, (float(value) for value in parts)))
-        except ValueError as exc:
-            bad = next((value for value in parts if not _is_number(value)), "")
-            raise ValueError(f"'{bad}' is not a number.") from exc
-    if any(value <= 0 for value in result.values()):
-        raise ValueError("All dimensions must be greater than zero.")
-    if shape == "tube" and result["inner_radius"] >= result["outer_radius"]:
-        raise ValueError("Tube inner radius must be smaller than outer radius.")
-    return result
-
-
-def _is_number(value: str) -> bool:
-    try:
-        float(value)
-        return True
-    except ValueError:
-        return False
-
-
-def create_cad_part(path, shape: str, dimensions: str, timeout: int = 300) -> str:
-    """Create and validate one primitive with build123d."""
-    path = Path(path)
-    shape = (shape or "").strip().lower()
-    if shape not in CAD_PRIMITIVES:
-        return f"Unknown shape '{shape}'. Supported shapes: {', '.join(CAD_PRIMITIVES)}."
-    extension = path.suffix.lower().lstrip(".")
-    if extension not in CONVERTIBLE_CAD_TARGETS:
-        return (
-            f"Supported output formats: {', '.join(CONVERTIBLE_CAD_TARGETS)}. "
-            "Native .FCStd output is no longer generated; use STEP for editable interchange."
-        )
-    try:
-        dims = _parse_dimensions(shape, dimensions)
-    except ValueError as exc:
-        return f"Invalid dimensions for {shape}: {exc}"
-    result = _run_worker({
-        "action": "primitive", "shape": shape, "dimensions": dims,
-        "output": str(path.resolve()), "workspace": str(path.parent.resolve()),
-    }, timeout=timeout)
-    if not result.get("ok"):
-        return f"Generation failed: {result.get('error', 'unknown CAD error')}"
-    problem = _existing_artifact(path, "CAD artifact")
-    if problem:
-        return f"Generation failed: {problem}"
-    return (
-        f"Created {path.name} ({path.stat().st_size} bytes) with build123d.\n"
-        + _format_metrics(result)
-    )
 
 
 def generate_cad_model(path, source: str, parameters: str = "{}",
@@ -692,71 +610,6 @@ def generate_cad_model(path, source: str, parameters: str = "{}",
         + "\nArtifacts:\n" + artifacts
     )
 
-
-def generate_cad_design(path, design: str, formats: str = "step,stl",
-                        timeout: int = 600) -> str:
-    """Compile a bounded declarative design and verify its complete artifact bundle."""
-    path = Path(path)
-    if path.suffix.lower() not in (".step", ".stp"):
-        return "Declarative CAD generation requires a .step output filename."
-    if not isinstance(design, str) or not design.strip():
-        return "CAD design must be a non-empty JSON object."
-    if len(design.encode("utf-8")) > MAX_DESIGN_BYTES:
-        return f"CAD design is too large (limit: {MAX_DESIGN_BYTES} bytes)."
-    try:
-        payload = json.loads(design)
-    except json.JSONDecodeError as exc:
-        return f"CAD design must be valid JSON: {exc}"
-    if not isinstance(payload, dict):
-        return "CAD design must be a JSON object."
-
-    requested = []
-    for item in (formats or "step").split(","):
-        value = item.strip().lower().lstrip(".")
-        if value and value not in requested:
-            requested.append(value)
-    unsupported = [item for item in requested if item not in CONVERTIBLE_CAD_TARGETS]
-    if unsupported:
-        return "Unsupported CAD output format(s): " + ", ".join(unsupported) + "."
-    if "step" not in requested:
-        requested.insert(0, "step")
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    design_path = path.with_suffix(".design.json")
-    params_path = path.with_suffix(".params.json")
-    report_path = path.with_suffix(".report.json")
-    preview_path = path.with_suffix(".preview.png")
-    design_path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
-    )
-    params = payload.get("parameters") if isinstance(payload.get("parameters"), dict) else {}
-    params_path.write_text(
-        json.dumps(params, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
-    )
-    result = _run_worker({
-        "action": "generate_design", "design": str(design_path.resolve()),
-        "output": str(path.resolve()), "report": str(report_path.resolve()),
-        "preview": str(preview_path.resolve()), "formats": requested,
-        "workspace": str(path.parent.resolve()),
-    }, timeout=timeout)
-    if not result.get("ok"):
-        return _worker_failure("CAD design generation failed", result)
-
-    expected = [path, design_path, params_path, report_path, preview_path]
-    for item in requested:
-        if item != "step":
-            expected.append(path.with_suffix("." + item))
-    failures = [problem for item in expected if (problem := _existing_artifact(item, item.name))]
-    if failures:
-        return "CAD design generation failed verification: " + "; ".join(failures)
-    if problem := _remove_obsolete_recipe(path, ".step.py"):
-        return "CAD design generation completed, but artifact cleanup failed: " + problem
-    artifacts = "\n".join(f"  - {item}" for item in expected)
-    return (
-        f"Generated and verified {path.name} from a declarative build123d design "
-        "with text-to-cad validation and snapshot review.\n"
-        + _format_metrics(result) + "\nArtifacts:\n" + artifacts
-    )
 
 
 def validate_cad_model(path, render: bool = True, timeout: int = 300) -> str:

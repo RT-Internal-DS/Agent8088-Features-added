@@ -24,34 +24,17 @@ _BLOCKED_METHODS = {
     "save", "saveas", "send", "system", "write",
 }
 
-_DESIGN_PRIMITIVES = {"box", "cylinder", "sphere", "cone", "tube"}
-_MAX_DESIGN_COMPONENTS = 256
-_MAX_DESIGN_PRIMITIVES = 2048
-_MAX_PLACEMENTS_PER_PRIMITIVE = 512
 _MAX_ABS_DIMENSION_MM = 1_000_000.0
 _MAX_GENERATOR_AST_NODES = 12_000
 _MAX_GENERATOR_PARAMETER_ITEMS = 10_000
 _MAX_GENERATOR_COLLECTION_ITEMS = 4_096
 _MAX_GENERATOR_RANGE_ITERATIONS = 4_096
 
-_DESIGN_FIELDS = {
-    "schema_version", "name", "units", "parameters", "components",
-    "verification", "interference_policy",
-}
-_COMPONENT_FIELDS = {"name", "add", "cut"}
-_ASSEMBLY_FIELDS = {
-    "schema_version", "name", "units", "parameters", "occurrences",
-    "verification", "interference_policy",
-}
-_OCCURRENCE_FIELDS = {"name", "component", "input", "at", "rotate"}
-_PRIMITIVE_COMMON_FIELDS = {"type", "at", "rotate", "placements"}
-_PRIMITIVE_FIELDS = {
-    "box": {"size"},
-    "cylinder": {"radius", "height"},
-    "sphere": {"radius"},
-    "cone": {"radius1", "radius2", "height"},
-    "tube": {"outer_radius", "inner_radius", "height"},
-}
+
+
+
+
+
 
 
 def _expression_value(value: Any, parameters: dict[str, Any],
@@ -124,266 +107,6 @@ def _vector(value: Any, parameters: dict[str, Any], field: str) -> tuple[float, 
     if not isinstance(value, list) or len(value) != 3:
         raise ValueError(f"{field} must contain exactly three values")
     return tuple(_expression_value(item, parameters) for item in value)
-
-
-def _primitive_shape(spec: dict[str, Any], parameters: dict[str, Any]):
-    """Compile one reviewed JSON primitive into build123d geometry."""
-    from build123d import Align, Box, Cone, Cylinder, Pos, Rot, Sphere
-
-    kind = str(spec.get("type") or "").strip().lower()
-    if kind not in _DESIGN_PRIMITIVES:
-        raise ValueError(
-            f"unsupported declarative primitive {kind!r}; use one of "
-            + ", ".join(sorted(_DESIGN_PRIMITIVES))
-        )
-    unknown = set(spec) - _PRIMITIVE_COMMON_FIELDS - _PRIMITIVE_FIELDS[kind]
-    if unknown:
-        raise ValueError(
-            f"{kind} primitive has unsupported field(s): {', '.join(sorted(unknown))}"
-        )
-    corner_align = (Align.MIN, Align.MIN, Align.MIN)
-    axis_align = (Align.CENTER, Align.CENTER, Align.MIN)
-    if kind == "box":
-        size = _vector(spec.get("size"), parameters, "box.size")
-        if any(item <= 0 for item in size):
-            raise ValueError("box dimensions must be greater than zero")
-        shape = Box(*size, align=corner_align)
-    elif kind == "cylinder":
-        radius = _expression_value(spec.get("radius"), parameters)
-        height = _expression_value(spec.get("height"), parameters)
-        if radius <= 0 or height <= 0:
-            raise ValueError("cylinder radius and height must be greater than zero")
-        shape = Cylinder(radius, height, align=axis_align)
-    elif kind == "sphere":
-        radius = _expression_value(spec.get("radius"), parameters)
-        if radius <= 0:
-            raise ValueError("sphere radius must be greater than zero")
-        shape = Sphere(radius)
-    elif kind == "cone":
-        radius1 = _expression_value(spec.get("radius1"), parameters)
-        radius2 = _expression_value(spec.get("radius2"), parameters)
-        height = _expression_value(spec.get("height"), parameters)
-        if radius1 < 0 or radius2 < 0 or not (radius1 or radius2) or height <= 0:
-            raise ValueError("cone radii must be non-negative and height positive")
-        shape = Cone(radius1, radius2, height, align=axis_align)
-    else:
-        outer = _expression_value(spec.get("outer_radius"), parameters)
-        inner = _expression_value(spec.get("inner_radius"), parameters)
-        height = _expression_value(spec.get("height"), parameters)
-        if inner <= 0 or outer <= inner or height <= 0:
-            raise ValueError("tube requires outer_radius > inner_radius > 0 and height > 0")
-        shape = (
-            Cylinder(outer, height, align=axis_align)
-            - Cylinder(inner, height, align=axis_align)
-        )
-
-    rotate = _vector(spec.get("rotate", [0, 0, 0]), parameters, "rotate")
-    at = _vector(spec.get("at", [0, 0, 0]), parameters, "at")
-    if any(rotate):
-        shape = Rot(*rotate) * shape
-    if any(at):
-        shape = Pos(*at) * shape
-    return shape
-
-
-def _expanded_primitives(spec: dict[str, Any], parameters: dict[str, Any]):
-    """Yield one primitive at each declared placement without source expansion."""
-    placements = spec.get("placements")
-    if placements is None:
-        yield _primitive_shape(spec, parameters)
-        return
-    if not isinstance(placements, list) or not placements:
-        raise ValueError("placements must be a non-empty array of [x, y, z] vectors")
-    if len(placements) > _MAX_PLACEMENTS_PER_PRIMITIVE:
-        raise ValueError(
-            f"one primitive may have at most {_MAX_PLACEMENTS_PER_PRIMITIVE} placements"
-        )
-    base_at = _vector(spec.get("at", [0, 0, 0]), parameters, "at")
-    for placement in placements:
-        offset = _vector(placement, parameters, "placement")
-        instance = dict(spec)
-        instance.pop("placements", None)
-        instance["at"] = [base_at[index] + offset[index] for index in range(3)]
-        yield _primitive_shape(instance, parameters)
-
-
-def _build_design(design: dict[str, Any]):
-    """Compile the bounded declarative schema to a labeled build123d assembly."""
-    unknown_design = set(design) - _DESIGN_FIELDS
-    if unknown_design:
-        raise ValueError(
-            "design has unsupported field(s): " + ", ".join(sorted(unknown_design))
-        )
-    if int(design.get("schema_version", 1)) != 1:
-        raise ValueError("unsupported CAD design schema_version; expected 1")
-    if str(design.get("units", "mm")).lower() != "mm":
-        raise ValueError("declarative CAD currently requires millimetres")
-    if str(design.get("interference_policy", "error")).lower() != "error":
-        raise ValueError(
-            "declarative CAD always rejects volumetric assembly overlap; "
-            "interference_policy cannot disable this validation"
-        )
-    from build123d import Compound
-
-    parameters = design.get("parameters") or {}
-    if not isinstance(parameters, dict):
-        raise TypeError("design.parameters must be a JSON object")
-    # Resolve every scalar once up front. This catches cycles/unknown names
-    # before OpenCascade starts doing expensive work.
-    for name, value in parameters.items():
-        if not isinstance(name, str) or not name.isidentifier():
-            raise ValueError(f"invalid CAD parameter name: {name!r}")
-        _expression_value(value, parameters, (name,))
-
-    components = design.get("components")
-    if not isinstance(components, list) or not components:
-        raise ValueError("design.components must be a non-empty array")
-    if len(components) > _MAX_DESIGN_COMPONENTS:
-        raise ValueError(f"design exceeds {_MAX_DESIGN_COMPONENTS} components")
-    names: set[str] = set()
-    built = []
-    component_metrics: dict[str, dict[str, Any]] = {}
-    solid_names: list[str] = []
-    primitive_count = 0
-    for index, component in enumerate(components):
-        if not isinstance(component, dict):
-            raise TypeError(f"component {index} must be a JSON object")
-        unknown_component = set(component) - _COMPONENT_FIELDS
-        if unknown_component:
-            raise ValueError(
-                f"component {index} has unsupported field(s): "
-                + ", ".join(sorted(unknown_component))
-            )
-        name = str(component.get("name") or "").strip()
-        if not name or name in names:
-            raise ValueError(f"component names must be non-empty and unique: {name!r}")
-        names.add(name)
-        additions = component.get("add")
-        cuts = component.get("cut") or []
-        if not isinstance(additions, list) or not additions:
-            raise ValueError(f"component {name!r} needs a non-empty add array")
-        if not isinstance(cuts, list):
-            raise TypeError(f"component {name!r} cut must be an array")
-        add_shapes = []
-        for primitive in additions:
-            if not isinstance(primitive, dict):
-                raise TypeError(f"component {name!r} has a non-object primitive")
-            instances = list(_expanded_primitives(primitive, parameters))
-            primitive_count += len(instances)
-            add_shapes.extend(instances)
-        if primitive_count > _MAX_DESIGN_PRIMITIVES:
-            raise ValueError(f"design exceeds {_MAX_DESIGN_PRIMITIVES} primitive instances")
-        shape = add_shapes[0]
-        if len(add_shapes) > 1:
-            shape = shape.fuse(*add_shapes[1:])
-        for primitive in cuts:
-            if not isinstance(primitive, dict):
-                raise TypeError(f"component {name!r} has a non-object cut")
-            for cutter in _expanded_primitives(primitive, parameters):
-                primitive_count += 1
-                if primitive_count > _MAX_DESIGN_PRIMITIVES:
-                    raise ValueError(f"design exceeds {_MAX_DESIGN_PRIMITIVES} primitive instances")
-                shape = shape - cutter
-        shape.label = name
-        built.append(shape)
-        component_solids = list(shape.solids())
-        component_metrics[name] = {
-            "solid_count": len(component_solids),
-            "volume": sum(float(solid.volume) for solid in component_solids),
-            "bounding_box": _bbox(shape),
-        }
-        solid_names.extend(
-            name if len(component_solids) == 1 else f"{name}[{index}]"
-            for index in range(len(component_solids))
-        )
-    assembly = built[0] if len(built) == 1 else Compound(children=built)
-    assembly.label = str(design.get("name") or "assembly")
-    return (
-        assembly, parameters, names, solid_names, primitive_count,
-        component_metrics,
-    )
-
-
-def _build_project_assembly(spec: dict[str, Any], workspace: Path):
-    """Load verified component STEP files and apply bounded placements."""
-    unknown = set(spec) - _ASSEMBLY_FIELDS
-    if unknown:
-        raise ValueError(
-            "assembly has unsupported field(s): " + ", ".join(sorted(unknown))
-        )
-    if int(spec.get("schema_version", 1)) != 1:
-        raise ValueError("unsupported CAD assembly schema_version; expected 1")
-    if str(spec.get("units", "mm")).lower() != "mm":
-        raise ValueError("CAD project assemblies require millimetres")
-    if str(spec.get("interference_policy", "error")).lower() != "error":
-        raise ValueError("CAD project assemblies always reject volumetric overlap")
-    parameters = spec.get("parameters") or {}
-    if not isinstance(parameters, dict):
-        raise TypeError("assembly.parameters must be a JSON object")
-    for name, value in parameters.items():
-        if not isinstance(name, str) or not name.isidentifier():
-            raise ValueError(f"invalid CAD parameter name: {name!r}")
-        _expression_value(value, parameters, (name,))
-
-    occurrences = spec.get("occurrences")
-    if not isinstance(occurrences, list) or not occurrences:
-        raise ValueError("assembly.occurrences must be a non-empty array")
-    if len(occurrences) > 512:
-        raise ValueError("assembly exceeds 512 occurrences")
-    from build123d import Compound, Pos, Rot
-
-    built = []
-    names: set[str] = set()
-    component_metrics: dict[str, dict[str, Any]] = {}
-    solid_names: list[str] = []
-    for index, occurrence in enumerate(occurrences):
-        if not isinstance(occurrence, dict):
-            raise TypeError(f"assembly occurrence {index} must be a JSON object")
-        extra = set(occurrence) - _OCCURRENCE_FIELDS
-        if extra:
-            raise ValueError(
-                f"assembly occurrence {index} has unsupported field(s): "
-                + ", ".join(sorted(extra))
-            )
-        name = str(occurrence.get("name") or "").strip()
-        if not name or name in names:
-            raise ValueError(f"assembly occurrence names must be non-empty and unique: {name!r}")
-        names.add(name)
-        raw_input = str(occurrence.get("input") or "").strip()
-        if not raw_input:
-            raise ValueError(f"assembly occurrence {name!r} has no component input")
-        input_path = (workspace / raw_input).resolve()
-        try:
-            input_path.relative_to(workspace)
-        except ValueError as exc:
-            raise ValueError(
-                f"assembly occurrence {name!r} input is outside its authorized workspace"
-            ) from exc
-        if input_path.suffix.lower() not in {".step", ".stp"} or not input_path.is_file():
-            raise ValueError(f"assembly occurrence {name!r} component STEP is missing")
-        shape = _load_shape(input_path)
-        rotate = _vector(occurrence.get("rotate", [0, 0, 0]), parameters, "rotate")
-        at = _vector(occurrence.get("at", [0, 0, 0]), parameters, "at")
-        if any(rotate):
-            shape = Rot(*rotate) * shape
-        if any(at):
-            shape = Pos(*at) * shape
-        shape.label = name
-        built.append(shape)
-        solids = list(shape.solids())
-        component_metrics[name] = {
-            "solid_count": len(solids),
-            "volume": sum(float(solid.volume) for solid in solids),
-            "bounding_box": _bbox(shape),
-        }
-        solid_names.extend(
-            name if len(solids) == 1 else f"{name}[{solid_index}]"
-            for solid_index in range(len(solids))
-        )
-    assembly = built[0] if len(built) == 1 else Compound(children=built)
-    assembly.label = str(spec.get("name") or "assembly")
-    return assembly, parameters, names, solid_names, component_metrics
-
 
 def _positive_int(value: Any, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -515,24 +238,6 @@ def _verify_geometry_expectations(
     }
 
 
-def _verify_design_expectations(
-        design: dict[str, Any], overall: dict[str, Any],
-        components: dict[str, dict[str, Any]], parameters: dict[str, Any],
-) -> dict[str, Any]:
-    return _verify_geometry_expectations(
-        design.get("verification"), overall, components, parameters,
-        component_checks=True,
-    )
-
-
-def _name_interferences(interference: dict[str, Any], solid_names: list[str]) -> None:
-    """Attach stable component labels to pairwise solid findings in place."""
-    for item in interference.get("interferences") or []:
-        left, right = int(item["solid_a"]), int(item["solid_b"])
-        if left < len(solid_names):
-            item["component_a"] = solid_names[left]
-        if right < len(solid_names):
-            item["component_b"] = solid_names[right]
 
 
 def _validate_generator_source(path: Path) -> None:
@@ -944,24 +649,6 @@ def _export_step_meshes(step: Path, outputs: list[tuple[str, Path]], workspace: 
         _verify_export(output)
 
 
-def _make_primitive(name: str, dimensions: dict[str, float]):
-    from build123d import Box, Cone, Cylinder, Sphere
-
-    if name == "box":
-        return Box(dimensions["length"], dimensions["width"], dimensions["height"])
-    if name == "cylinder":
-        return Cylinder(dimensions["radius"], dimensions["height"])
-    if name == "sphere":
-        return Sphere(dimensions["radius"])
-    if name == "cone":
-        return Cone(dimensions["bottom_radius"], dimensions["top_radius"], dimensions["height"])
-    if name == "tube":
-        return (
-            Cylinder(dimensions["outer_radius"], dimensions["height"])
-            - Cylinder(dimensions["inner_radius"], dimensions["height"])
-        )
-    raise ValueError(f"unknown primitive: {name}")
-
 
 def _render(model: Path, output: Path) -> None:
     import io
@@ -1000,7 +687,7 @@ def _write_report(path: Path, payload: dict[str, Any]) -> None:
 def _require_workspace_paths(request: dict[str, Any]) -> None:
     workspace = Path(request["workspace"]).resolve()
     for key in (
-        "input", "output", "source", "design", "assembly", "params", "report", "preview",
+        "input", "output", "source", "params", "report", "preview",
     ):
         raw = str(request.get(key) or "").strip()
         if not raw:
@@ -1015,18 +702,6 @@ def _require_workspace_paths(request: dict[str, Any]) -> None:
 def _action(request: dict[str, Any]) -> dict[str, Any]:
     _require_workspace_paths(request)
     action = str(request.get("action") or "")
-    if action == "primitive":
-        output = Path(request["output"]).resolve()
-        shape = _make_primitive(str(request["shape"]), dict(request["dimensions"]))
-        shape.label = str(request["shape"])
-        _write_shape(shape, output)
-        _verify_export(output)
-        reopened = _load_shape(output) if output.suffix.lower() in {".step", ".stp", ".brep", ".stl"} else shape
-        result = _metrics(reopened, mesh=output.suffix.lower() == ".stl")
-        if not result["validity"]["ok"]:
-            raise RuntimeError("generated primitive failed validation: " + ", ".join(result["validity"]["reasons"]))
-        return {"ok": True, **result}
-
     if action == "inspect":
         input_path = Path(request["input"]).resolve()
         if input_path.suffix.lower() == ".glb":
@@ -1055,9 +730,7 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
             **_metrics(reopened, mesh=output.suffix.lower() == ".stl"),
         }
 
-    if action in {"generate", "generate_design", "assemble_project", "validate"}:
-        solid_names: list[str] = []
-        component_metrics: dict[str, dict[str, Any]] = {}
+    if action in {"generate", "validate"}:
         request_verification = {
             "provided": False, "ok": True, "checks": [], "failures": [],
             "note": "Not applicable to this workflow.",
@@ -1079,30 +752,6 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
             )
             if exit_code:
                 raise RuntimeError(f"text-to-cad generation failed (exit {exit_code})")
-        elif action == "generate_design":
-            design_path = Path(request["design"]).resolve()
-            design = json.loads(design_path.read_text(encoding="utf-8"))
-            if not isinstance(design, dict):
-                raise TypeError("CAD design must be a JSON object")
-            output = Path(request["output"]).resolve()
-            (
-                shape, parameters, component_names, solid_names, primitive_count,
-                component_metrics,
-            ) = _build_design(design)
-            _write_shape(shape, output)
-        elif action == "assemble_project":
-            assembly_path = Path(request["assembly"]).resolve()
-            assembly = json.loads(assembly_path.read_text(encoding="utf-8"))
-            if not isinstance(assembly, dict):
-                raise TypeError("CAD assembly must be a JSON object")
-            output = Path(request["output"]).resolve()
-            (
-                shape, parameters, component_names, solid_names,
-                component_metrics,
-            ) = _build_project_assembly(
-                assembly, Path(request["workspace"]).resolve()
-            )
-            _write_shape(shape, output)
         else:
             output = Path(request["input"]).resolve()
 
@@ -1113,18 +762,7 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
         if not result["validity"]["ok"]:
             raise RuntimeError("generated STEP failed validation: " + ", ".join(result["validity"]["reasons"]))
         interference = _assembly_interference(shape)
-        if solid_names:
-            _name_interferences(interference, solid_names)
-        if action == "generate_design":
-            request_verification = _verify_design_expectations(
-                design, result, component_metrics, parameters,
-            )
-        elif action == "assemble_project":
-            request_verification = _verify_geometry_expectations(
-                assembly.get("verification"), result, component_metrics,
-                parameters, component_checks=True,
-            )
-        elif action == "generate":
+        if action == "generate":
             request_verification = _verify_geometry_expectations(
                 request.get("verification"), result, {}, parameters,
                 component_checks=False,
@@ -1137,7 +775,7 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
         generation_valid = (
             not interference.get("interferences") and request_verification["ok"]
         )
-        if action in {"generate", "generate_design", "assemble_project"} and generation_valid:
+        if action == "generate" and generation_valid:
             requested = [str(name) for name in (request.get("formats") or []) if name != "step"]
             mesh_outputs = [
                 (name, output.with_suffix("." + name))
@@ -1157,25 +795,14 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
         report_payload = {
             "engine": {"geometry": "build123d", "workflow": "text-to-cad/cadgen"},
             "source": str(request.get("source") or ""),
-            "design": str(request.get("design") or ""),
-            "assembly": str(request.get("assembly") or ""),
             "step": str(output),
             "preview": preview_text,
             "assembly_interference": interference,
             "request_verification": request_verification,
             **result,
         }
-        if action in {"generate_design", "assemble_project"}:
-            report_payload["component_names"] = sorted(component_names)
-            report_payload["component_count"] = len(component_names)
-            report_payload["parameters"] = parameters
-            report_payload["solid_names"] = solid_names
-            report_payload["component_metrics"] = component_metrics
-            if action == "generate_design":
-                report_payload["primitive_count"] = primitive_count
         _write_report(report, report_payload)
-        if action in {"generate", "generate_design", "assemble_project"} \
-                and interference.get("interferences"):
+        if action == "generate" and interference.get("interferences"):
             pairs = interference["interferences"]
             summaries = []
             for item in pairs[:20]:
@@ -1191,8 +818,7 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
                 "report": str(report), "preview": preview_text,
                 "assembly_interference": interference, **result,
             }
-        if action in {"generate", "generate_design", "assemble_project"} \
-                and not request_verification["ok"]:
+        if action == "generate" and not request_verification["ok"]:
             summaries = []
             for item in request_verification["failures"][:20]:
                 summaries.append(
@@ -1210,12 +836,6 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
             "ok": True, "report": str(report), "preview": preview_text,
             "assembly_interference": report_payload["assembly_interference"],
             "request_verification": request_verification,
-            **({
-                "component_names": sorted(component_names),
-                "component_count": len(component_names),
-                **({"primitive_count": primitive_count}
-                   if action == "generate_design" else {}),
-            } if action in {"generate_design", "assemble_project"} else {}),
             **result,
         }
 
@@ -1240,7 +860,7 @@ def main(argv: list[str] | None = None) -> int:
         if "outside its authorized workspace" in lower:
             code, retryable = "cad_runtime_error", False
         elif (
-            action_hint in {"generate", "generate_design", "assemble_project"}
+            action_hint == "generate"
             and isinstance(exc, (TypeError, ValueError))
         ) or any(marker in lower for marker in (
             "syntax", "constructor arguments", "expression",

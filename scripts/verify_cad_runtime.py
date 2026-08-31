@@ -134,31 +134,45 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[1]
     worker = root / "src" / "agent8088" / "cad_worker.py"
-    with tempfile.TemporaryDirectory(prefix="agent8088-cad-smoke-") as raw:
+    # Windows antivirus/indexers can briefly retain a handle after Chromium or
+    # OpenCascade exits. That must not turn a successful installer smoke test
+    # into a failure; the OS temp directory remains safe to reap later.
+    with tempfile.TemporaryDirectory(
+        prefix="agent8088-cad-smoke-", ignore_cleanup_errors=True
+    ) as raw:
         workspace = Path(raw)
         output = workspace / "box.step"
         request = workspace / "request.json"
-        request.write_text(
-            json.dumps({
-                "action": "primitive",
-                "shape": "box",
-                "dimensions": {"length": 2, "width": 3, "height": 5},
-                "output": str(output),
-                "workspace": str(workspace),
-            }),
-            encoding="utf-8",
-        )
-        completed = subprocess.run(
-            [sys.executable, "-I", str(worker), str(request)],
-            capture_output=True,
-            text=True,
-            timeout=180,
-            check=False,
-        )
-        if completed.returncode:
-            print(completed.stdout, file=sys.stderr)
-            print(completed.stderr, file=sys.stderr)
-            return completed.returncode
+        # Exercise Agent8088's real owned-process JSON-RPC client, not merely a
+        # direct build123d import. This catches protocol changes, missing MCP
+        # tools, Windows subprocess-host incompatibilities, and export wiring.
+        sys.path.insert(0, str(root / "src"))
+        from agent8088 import cad_mcp
+
+        try:
+            cad_mcp.RUNTIME.begin(
+                workspace, "box", {"length": 2, "width": 3, "height": 5},
+                {"solid_count": 1, "bounding_box": [2, 3, 5]},
+            )
+            built = cad_mcp.RUNTIME.execute(
+                "from build123d import *\n"
+                "part = Box(2, 3, 5)\n"
+                "show(part, 'box')\n",
+                checkpoint="box_complete",
+            )
+            if "error" in built.lower():
+                raise RuntimeError(built)
+            measured = cad_mcp.RUNTIME.measure("box")
+            if '"volume": 30' not in measured.replace(".0", ""):
+                raise RuntimeError("build123d-mcp returned an unexpected box volume: " + measured)
+            gate = cad_mcp.RUNTIME.validate("box")
+            if '"passes_gate": true' not in gate.lower():
+                raise RuntimeError("build123d-mcp validity gate failed: " + gate)
+            cad_mcp.RUNTIME.export("box", ["step", "stl"], "box")
+        finally:
+            cad_mcp.RUNTIME.close()
+        if not output.is_file() or not (workspace / "box.stl").is_file():
+            raise RuntimeError("supervised build123d-mcp export did not create STEP and STL")
         report = workspace / "box.report.json"
         preview = workspace / "box.preview.png"
         request.write_text(
@@ -193,7 +207,7 @@ def main(argv=None) -> int:
         payload = json.loads(report.read_text(encoding="utf-8"))
         assert payload["validity"]["ok"] is True
         _viewer_smoke(args.viewer_root, workspace, output)
-        print("CAD runtime worker/export/reopen/render/viewer round trip: OK")
+        print("CAD MCP/worker/export/reopen/render/viewer round trip: OK")
     return 0
 
 

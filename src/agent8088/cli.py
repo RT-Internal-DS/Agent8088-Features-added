@@ -2884,7 +2884,8 @@ def cmd_doctor(rest):
     t.add_row("CLI-Anything", cli_label)
     cad_state = A.cad.cad_runtime_status()
     cad_label = (
-        f"ready (build123d {cad_state['build123d']}, cadgen {cad_state['cadgen']})"
+        f"ready (build123d-mcp {cad_state['build123d_mcp']}, "
+        f"build123d {cad_state['build123d']}, cadgen {cad_state['cadgen']}; supervised)"
         if cad_state["available"]
         else f"unavailable ({cad_state.get('reason', 'runtime probe failed')})"
     )
@@ -2950,6 +2951,8 @@ def cmd_dump(_rest):
         "",
         "## Advanced CAD",
         f"Available: {cad_state['available']}",
+        f"build123d-mcp expected: {cad_state['build123d_mcp']}",
+        f"MCP available: {cad_state['mcp_available']}",
         f"build123d expected: {cad_state['build123d']}",
         f"cadgen expected: {cad_state['cadgen']}",
         f"Runtime path: {cad_state['root']}",

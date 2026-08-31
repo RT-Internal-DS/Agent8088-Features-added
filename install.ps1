@@ -880,7 +880,7 @@ function Install-CadRuntime {
     $verifier = Join-Path $InstallDir "scripts\verify_cad_runtime.py"
     $viewerInstaller = Join-Path $InstallDir "scripts\install_cad_viewer.py"
     $viewerRoot = Join-Path $runtimeRoot "viewer"
-    $probe = "from importlib.metadata import version; import build123d,cadgen; assert version('build123d')=='0.11.1'; assert version('cadgen')=='0.4.28'"
+    $probe = "from importlib.metadata import version; import build123d,cadgen,build123d_mcp; assert version('build123d')=='0.11.1'; assert version('cadgen')=='0.4.28'; assert version('build123d-mcp')=='0.3.83'"
     $dependenciesReady = $false
 
     if (Test-Path -LiteralPath $runtimePy) {
@@ -888,7 +888,7 @@ function Install-CadRuntime {
             -Arguments @("-I", "-c", $probe) -TimeoutSec 30 -Activity "Checking advanced CAD runtime"
         if (-not $ready.TimedOut -and $ready.ExitCode -eq 0) {
             $dependenciesReady = $true
-            Write-Info "build123d + text-to-cad CAD dependencies already installed"
+            Write-Info "build123d-mcp + text-to-cad CAD dependencies already installed"
         } else {
             Write-Warn "Existing CAD runtime is incomplete - rebuilding it"
         }
@@ -906,7 +906,7 @@ function Install-CadRuntime {
 
     New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
     if (-not $dependenciesReady) {
-        Write-Info "Installing isolated build123d + text-to-cad CAD runtime..."
+        Write-Info "Installing isolated build123d-mcp + text-to-cad CAD runtime..."
         # cadgen 0.4.28 requires Python 3.11+, while Agent8088 core intentionally
         # still supports 3.10. Keep that requirement inside this isolated runtime.
         $cadPython = Invoke-WithTimeout -FilePath $script:UvCmd `
@@ -931,7 +931,7 @@ function Install-CadRuntime {
 
         $installResult = Invoke-WithTimeout -FilePath $script:UvCmd `
             -Arguments @("pip", "install", "--python", $runtimePy, "--requirement", $requirements) `
-            -TimeoutSec $TCadRuntime -Activity "Installing build123d and text-to-cad"
+            -TimeoutSec $TCadRuntime -Activity "Installing build123d-mcp and text-to-cad"
         if ($installResult.TimedOut -or $installResult.ExitCode -ne 0) {
             $why = if ($installResult.TimedOut) { "timed out after $([int]($TCadRuntime / 60))m" } else { "uv exit $($installResult.ExitCode)" }
             Register-SkippedStage -Label "Advanced CAD runtime" -Reason "dependency install failed ($why)" `
@@ -970,7 +970,7 @@ function Install-CadRuntime {
     # output, and a browser that installs but cannot render a CAD preview.
     $smoke = Invoke-WithTimeout -FilePath $runtimePy `
         -Arguments @("-I", $verifier, "--viewer-root", $viewerRoot) `
-        -TimeoutSec 300 -Activity "Verifying CAD generation, preview, and Viewer"
+        -TimeoutSec 600 -Activity "Verifying supervised CAD MCP, generation, preview, and Viewer"
     if ($smoke.TimedOut -or $smoke.ExitCode -ne 0) {
         Register-SkippedStage -Label "Advanced CAD runtime" `
             -Reason "installed packages failed the STEP, preview, and Viewer round-trip smoke test" `
@@ -979,7 +979,7 @@ function Install-CadRuntime {
     }
 
     $script:CadRuntimeInstalled = $true
-    Write-Success "build123d + text-to-cad CAD runtime and Viewer installed and verified"
+    Write-Success "build123d-mcp + text-to-cad CAD runtime and Viewer installed and verified"
     return $true
 }
 
@@ -2514,7 +2514,7 @@ function Verify-Install {
         Write-Host "  Browser:  Chromium missing (browse_page will show install instructions)"
     }
     if ($script:CadRuntimeInstalled) {
-        Write-Host "  CAD:      build123d + text-to-cad runtime and Viewer installed and verified"
+        Write-Host "  CAD:      build123d-mcp + text-to-cad runtime and Viewer installed and verified"
     } else {
         Write-Host "  CAD:      advanced CAD runtime unavailable (core agent still works)"
     }

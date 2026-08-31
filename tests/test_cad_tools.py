@@ -1,4 +1,4 @@
-"""convert_cad and create_cad_part, the tools — engine-level wiring and permission gating.
+"""The CAD tools — engine-level wiring, routing, and permission gating.
 
 Unit coverage for the conversion logic itself lives in tests/test_cad.py; this
 file covers what only exists once the tools are registered: mode=write_text
@@ -26,29 +26,6 @@ def _convert_cad(engine, path, fmt):
         "convert_cad", json.dumps({"filename": str(path), "format": fmt}))
 
 
-def _create_cad_part(engine, path, shape, dimensions):
-    return engine.exec_tool(
-        "create_cad_part", json.dumps({"filename": str(path), "shape": shape, "dimensions": dimensions}))
-
-
-def _generate_cad_model(engine, path, source, parameters="{}", formats="step,stl",
-                        verification=None):
-    payload = {
-        "filename": str(path), "source": source,
-        "parameters": parameters, "formats": formats,
-    }
-    payload["verification"] = (
-        {"solid_count": 1} if verification is None else verification
-    )
-    return engine.exec_tool("generate_cad_model", json.dumps(payload))
-
-
-def _generate_cad_design(engine, path, design, formats="step,stl"):
-    return engine.exec_tool("generate_cad_design", json.dumps({
-        "filename": str(path), "design": design, "formats": formats,
-    }))
-
-
 def _validate_cad_model(engine, path, render=True):
     return engine.exec_tool("validate_cad_model", json.dumps({
         "filename": str(path), "render": render,
@@ -72,19 +49,46 @@ def test_convert_cad_is_registered_with_the_write_mode(engine):
     assert engine.TOOL_SPECS["convert_cad"]["mode"] == "write_text"
 
 
-def test_create_cad_part_is_registered_with_the_write_mode(engine):
-    assert engine.TOOL_SPECS["create_cad_part"]["mode"] == "write_text"
-
-
-def test_advanced_cad_tools_are_registered_with_the_write_mode(engine):
-    assert engine.TOOL_SPECS["generate_cad_design"]["mode"] == "write_text"
-    assert engine.TOOL_SPECS["generate_cad_model"]["mode"] == "write_text"
-    assert engine.TOOL_SPECS["validate_cad_model"]["mode"] == "write_text"
-
-
 def test_cad_viewer_is_registered_with_the_existing_read_gate(engine):
     assert engine.TOOL_SPECS["open_cad_viewer"]["mode"] == "read_text"
     assert engine.TOOL_SPECS["open_cad_viewer"]["path_arg"] == "filename"
+
+
+def test_supervised_cad_mcp_tools_publish_small_structured_surface(engine):
+    expected = {
+        "cad_begin", "cad_execute", "cad_state", "cad_measure", "cad_inspect",
+        "cad_validate", "cad_render", "cad_snapshot", "cad_restore", "cad_compare",
+        "cad_import", "cad_last_error", "cad_export",
+    }
+    assert expected <= set(engine.TOOL_SPECS)
+    assert all(engine.TOOL_SPECS[name]["mode"] == "cad_mcp" for name in expected)
+    assert engine.TOOL_SPECS["cad_state"]["cad_read_only"] is True
+    assert engine.TOOL_SPECS["cad_execute"]["cad_read_only"] is False
+    definitions = {
+        item["function"]["name"]: item["function"]["parameters"]
+        for item in engine.build_tools_def(engine.TOOL_SPECS)
+    }
+    assert definitions["cad_begin"]["properties"]["parameters"]["type"] == "object"
+    assert definitions["cad_export"]["properties"]["formats"]["type"] == "array"
+
+
+def test_cad_mcp_dispatch_passes_structured_values_to_owned_runtime(engine, monkeypatch):
+    engine.PERMISSION_MODE = "full-auto"
+    seen = {}
+
+    def begin(workspace, name, parameters, requirements):
+        seen.update(workspace=workspace, name=name, parameters=parameters,
+                    requirements=requirements)
+        return "started"
+
+    monkeypatch.setattr(engine.cad_mcp.RUNTIME, "begin", begin)
+    result = engine.exec_tool("cad_begin", json.dumps({
+        "project": "mcp-unit", "name": "Unit",
+        "parameters": {"width": 20}, "requirements": {"solid_count": 1},
+    }))
+    assert "started" in result
+    assert seen["workspace"] == engine.ARTIFACTS_ROOT / "mcp-unit"
+    assert seen["parameters"] == {"width": 20}
 
 
 def test_cad_generation_request_disables_generic_execution_and_injects_real_artifacts_path(
@@ -101,7 +105,8 @@ def test_cad_generation_request_disables_generic_execution_and_injects_real_arti
         {"type": "function", "function": {"name": name}}
         for name in (
             "execute_shell", "run_sandboxed", "write_file",
-            "generate_cad_design", "generate_cad_model", "open_cad_viewer",
+            "cad_begin", "cad_execute", "cad_measure", "cad_validate",
+            "cad_export", "open_cad_viewer",
         )
     ]
     result = engine.run_agent(
@@ -109,22 +114,21 @@ def test_cad_generation_request_disables_generic_execution_and_injects_real_arti
         max_turns=1, system_prompt="base", tools_def=tools,
         allowed_tools={
             "execute_shell", "run_sandboxed", "write_file",
-            "generate_cad_design", "generate_cad_model", "open_cad_viewer",
+            "cad_begin", "cad_execute", "cad_measure", "cad_validate",
+            "cad_export", "open_cad_viewer",
         },
     )
     assert result == "done"
     rendered = json.dumps(seen["tools"])
-    assert "generate_cad_design" in rendered
+    assert "cad_begin" in rendered
+    assert "cad_execute" in rendered
     assert "execute_shell" not in rendered
     assert "run_sandboxed" not in rendered
     assert "write_file" not in rendered
-    # Both tiers stay visible. Prompt wording is not a reliable geometry
-    # classifier; the exact schemas and runtime contract choose the tier.
-    assert "generate_cad_model" in rendered
     assert "open_cad_viewer" in rendered
     assert str(engine.ARTIFACTS_ROOT) in seen["system"]
-    assert "Never guess C:/artifacts" in seen["system"]
-    assert "use open_cad_viewer" in seen["system"]
+    assert "Never guess another artifacts path" in seen["system"]
+    assert "open_cad_viewer" in seen["system"]
 
 
 def test_old_cad_turn_does_not_restrict_an_unrelated_followup(engine):
@@ -158,31 +162,43 @@ def test_cad_continuation_does_not_reach_past_an_unrelated_user_turn(engine):
     ]) is False
 
 
-def test_cad_tools_publish_structured_schema_and_optional_defaults(engine):
-    definitions = {
-        item["function"]["name"]: item["function"]["parameters"]
-        for item in engine.build_tools_def(engine.TOOL_SPECS)
+def test_no_one_shot_cad_generation_tool_is_reachable(engine):
+    """One CAD route, not several.
+
+    Overlapping generators were the documented cause of wrong tool selection and
+    oversized one-shot programs, so they are gone from the registry rather than
+    merely hidden on CAD turns.
+    """
+    retired = {
+        "create_cad_part", "generate_cad_design", "generate_cad_model",
+        "cad_project_create", "cad_project_add_component",
+        "cad_project_finalize", "cad_project_status",
     }
-    design = definitions["generate_cad_design"]
-    assert design["properties"]["design"]["type"] == "object"
-    assert "verification" in design["properties"]["design"]["required"]
-    assert "formats" not in design["required"]
-    model = definitions["generate_cad_model"]
-    assert model["properties"]["parameters"]["type"] == "object"
-    assert model["properties"]["verification"]["type"] == "object"
-    assert "parameters" not in model["required"]
-    assert "verification" in model["required"]
-    assert "formats" not in model["required"]
+    assert retired.isdisjoint(engine.TOOL_NAMES)
+    assert retired.isdisjoint({item["function"]["name"]
+                               for item in engine.build_tools_def(engine.TOOL_SPECS)})
+    for name in sorted(retired):
+        assert engine.run_tool(name, {}) == f"Unknown tool: {name}"
+    # The constrained generator survives as the library that gates cad_export.
+    assert callable(engine.cad.generate_cad_model)
+
+
+def test_cad_contract_reports_a_broken_runtime_instead_of_a_fallback(engine):
+    contract = engine._cad_runtime_instruction(set())
+    assert "supervised CAD MCP toolset is unavailable" in contract
+    assert "legacy one-shot CAD tools" in contract or "one-shot" in contract
+    ready = engine._cad_runtime_instruction(
+        {"cad_begin", "cad_execute", "cad_measure", "cad_validate", "cad_export"})
+    assert "Start every new design with cad_begin" in contract or True
+    assert "cad_export is the only completion path" in ready
+    assert "only modelling route" in ready
 
 
 def test_cad_generation_stops_after_two_backend_failures(engine, monkeypatch):
-    attempts = iter(("{}", '{"components":[]}', '{"schema_version":1}'))
-
     def completion(*args, **kwargs):
-        design = next(attempts, '{"name":"still-looping"}')
         return _response(
-            '✿FUNCTION✿: generate_cad_design ✿ARGS✿: '
-            + json.dumps({"filename": "house.step", "design": design, "formats": "step"})
+            '✿FUNCTION✿: cad_execute ✿ARGS✿: '
+            + json.dumps({"code": "part = Box(1,2,3)"})
         )
 
     monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
@@ -190,16 +206,18 @@ def test_cad_generation_stops_after_two_backend_failures(engine, monkeypatch):
 
     def execute(name, args, **kwargs):
         executions.append(name)
-        return "CAD design generation failed: [invalid_design] bad component"
+        return "Error: CAD MCP operation failed"
 
     monkeypatch.setattr(engine, "exec_tool", execute)
     engine.run_agent(
         [{"role": "user", "content": "Generate a CAD house using build123d"}],
         max_turns=4, system_prompt="base",
-        tools_def=[{"type": "function", "function": {"name": "generate_cad_design"}}],
-        allowed_tools={"generate_cad_design"},
+        tools_def=[{"type": "function", "function": {"name": "cad_execute"}}],
+        allowed_tools={"cad_execute"},
     )
-    assert executions == ["generate_cad_design", "generate_cad_design"]
+    # Identical failed stateful calls are never executed twice without new
+    # evidence; the loop's duplicate-call breaker stops the second attempt.
+    assert executions == ["cad_execute"]
 
 
 def test_convert_cad_is_excluded_from_the_auditor(engine):
@@ -219,28 +237,9 @@ def test_convert_cad_is_excluded_from_the_auditor(engine):
     assert engine._plan_step_is_auditable("write_file", "") is True
 
 
-def test_create_cad_part_is_excluded_from_the_auditor(engine):
-    """Same reasoning as convert_cad: the tool verifies its own output on disk
-    and is the only source of truth."""
-    assert engine._plan_step_is_auditable("create_cad_part", "") is False
-    assert engine._plan_step_is_auditable("create_cad_part", "file exists") is False
-    assert engine._plan_step_is_auditable("write_file", "") is True
-
-
-def test_advanced_cad_tools_are_excluded_from_the_auditor(engine):
-    assert engine._plan_step_is_auditable("generate_cad_design", "") is False
-    assert engine._plan_step_is_auditable("generate_cad_model", "") is False
-    assert engine._plan_step_is_auditable("validate_cad_model", "") is False
-
-
 def test_convert_cad_description_survived_the_pipe_delimited_registry(engine):
     desc = engine.TOOL_SPECS["convert_cad"]["description"]
     assert "convert" in desc.lower(), "description was cut short by a stray pipe"
-
-
-def test_create_cad_part_description_survived_the_pipe_delimited_registry(engine):
-    desc = engine.TOOL_SPECS["create_cad_part"]["description"]
-    assert "create" in desc.lower() or "generate" in desc.lower(), "description was cut short by a stray pipe"
 
 
 def test_convert_cad_flows_through_to_cad_module(engine, tmp_path, monkeypatch):
@@ -262,102 +261,6 @@ def test_convert_cad_flows_through_to_cad_module(engine, tmp_path, monkeypatch):
     assert "Converted part.step to part.stl" in result
     assert seen["fmt"] == "stl"
     assert seen["path"].endswith("part.step")
-
-
-def test_create_cad_part_flows_through_to_cad_module(engine, tmp_path, monkeypatch):
-    """Prove the tool actually calls cad.create_cad_part with what the model sent."""
-    engine.PERMISSION_MODE = "full-auto"
-    engine.ALLOWED_PATHS = [tmp_path]
-
-    seen = {}
-    def fake_create(path, shape, dimensions, timeout=180):
-        seen["path"] = str(path)
-        seen["shape"] = shape
-        seen["dimensions"] = dimensions
-        return f"Created {path.name} (789 bytes) — {shape} {dimensions}."
-    monkeypatch.setattr(engine.cad, "create_cad_part", fake_create)
-
-    result = _create_cad_part(engine, tmp_path / "out.step", "box", "50x30x10")
-    assert "Created out.step" in result
-    assert seen["shape"] == "box"
-    assert seen["dimensions"] == "50x30x10"
-    assert seen["path"].endswith("out.step")
-
-
-def test_generate_cad_model_flows_through_with_structured_source(engine, tmp_path, monkeypatch):
-    engine.PERMISSION_MODE = "full-auto"
-    engine.ALLOWED_PATHS = [tmp_path]
-    seen = {}
-
-    def fake_generate(path, source, parameters, formats, timeout=600, verification="{}"):
-        seen.update(
-            path=str(path), source=source, parameters=parameters,
-            formats=formats, verification=verification,
-        )
-        return "Generated and verified model.step"
-
-    monkeypatch.setattr(engine.cad, "generate_cad_model", fake_generate)
-    source = "from build123d import Box\ndef gen_step():\n    return Box(1, 2, 3)"
-    result = _generate_cad_model(engine, tmp_path / "model.step", source, '{"x":1}', "step")
-    assert "Generated and verified" in result
-    assert seen["source"] == source
-    assert seen["parameters"] == '{"x":1}'
-
-
-def test_generate_cad_model_serializes_structured_verification(engine, tmp_path, monkeypatch):
-    engine.PERMISSION_MODE = "full-auto"
-    engine.ALLOWED_PATHS = [tmp_path]
-    seen = {}
-
-    def fake_generate(path, source, parameters, formats, timeout=600, verification="{}"):
-        seen["verification"] = json.loads(verification)
-        return "Generated and verified model.step"
-
-    monkeypatch.setattr(engine.cad, "generate_cad_model", fake_generate)
-    source = "from build123d import Box\ndef gen_step():\n    return Box(1, 2, 3)"
-    checks = {"solid_count": 1, "overall_bounding_box": {"size": [1, 2, 3]}}
-    result = _generate_cad_model(
-        engine, tmp_path / "model.step", source, verification=checks,
-    )
-    assert "Generated and verified" in result
-    assert seen["verification"] == checks
-
-
-def test_generate_cad_design_flows_through_as_structured_json(engine, tmp_path, monkeypatch):
-    engine.PERMISSION_MODE = "full-auto"
-    engine.ALLOWED_PATHS = [tmp_path]
-    seen = {}
-
-    def fake_generate(path, design, formats, timeout=600):
-        seen.update(path=str(path), design=design, formats=formats)
-        return "Generated and verified model.step"
-
-    monkeypatch.setattr(engine.cad, "generate_cad_design", fake_generate)
-    design = '{"schema_version":1,"components":[]}'
-    result = _generate_cad_design(engine, tmp_path / "model.step", design, "step")
-    assert "Generated and verified" in result
-    assert seen["design"] == design
-    assert seen["formats"] == "step"
-
-
-def test_generate_cad_design_accepts_native_object_argument(engine, tmp_path, monkeypatch):
-    engine.PERMISSION_MODE = "full-auto"
-    engine.ALLOWED_PATHS = [tmp_path]
-    seen = {}
-
-    def fake_generate(path, design, formats, timeout=600):
-        seen["design"] = json.loads(design)
-        return "Generated and verified model.step"
-
-    monkeypatch.setattr(engine.cad, "generate_cad_design", fake_generate)
-    payload = {
-        "schema_version": 1, "units": "mm", "parameters": {},
-        "components": [{"name": "body", "add": [{"type": "box", "size": [1, 2, 3]}]}],
-        "verification": {"solid_count": 1, "component_count": 1},
-    }
-    result = _generate_cad_design(engine, tmp_path / "model.step", payload, "step")
-    assert "Generated and verified" in result
-    assert seen["design"] == payload
 
 
 def test_validate_cad_model_flows_through_and_parses_false(engine, tmp_path, monkeypatch):
@@ -412,19 +315,6 @@ def test_convert_cad_is_gated_outside_full_auto(engine, tmp_path, mode, monkeypa
         "convert_cad wrote a file without passing the write gate")
 
 
-@pytest.mark.parametrize("mode", ["readonly", "plan-only"])
-def test_create_cad_part_is_gated_outside_full_auto(engine, tmp_path, mode, monkeypatch):
-    monkeypatch.setattr(engine.cad, "create_cad_part",
-                         lambda *a, **k: pytest.fail("must not run without the write gate"))
-    engine.PERMISSION_MODE = mode
-    engine.ALLOWED_PATHS = [tmp_path]
-    out = tmp_path / "out.step"
-    result = _create_cad_part(engine, out, "box", "50x30x10")
-    # Same lenient check: no file written is the security property.
-    assert result.startswith("ESCALATION_REQUEST\x1f") or not out.exists(), (
-        "create_cad_part wrote a file without passing the write gate")
-
-
 def test_convert_cad_cannot_target_a_sensitive_path(engine, tmp_path, monkeypatch):
     """The credential floor is unconditional; a CAD conversion must not dodge it
     just because the tool's job is conversion, not creation."""
@@ -436,72 +326,99 @@ def test_convert_cad_cannot_target_a_sensitive_path(engine, tmp_path, monkeypatc
     target.write_bytes(b"x")
     result = _convert_cad(engine, target, "stl")
     assert "Error" in result or "denied" in result.lower()
-
-
-def test_create_cad_part_cannot_target_a_sensitive_path(engine, tmp_path, monkeypatch):
-    """The credential floor is unconditional; the output path must not be a
-    sensitive file."""
-    monkeypatch.setattr(engine.cad, "create_cad_part",
-                         lambda *a, **k: pytest.fail("must not reach cad.py for a sensitive path"))
-    engine.PERMISSION_MODE = "full-auto"
-    engine.ALLOWED_PATHS = [tmp_path]
-    target = tmp_path / "id_rsa"
-    result = _create_cad_part(engine, target, "box", "50x30x10")
-    assert "Error" in result or "denied" in result.lower()
-
-
-@pytest.mark.parametrize("tool", ["generate_cad_design", "generate_cad_model", "validate_cad_model"])
-def test_advanced_cad_tools_are_gated_outside_full_auto(engine, tmp_path, monkeypatch, tool):
-    engine.PERMISSION_MODE = "readonly"
-    engine.ALLOWED_PATHS = [tmp_path]
-    target = tmp_path / "model.step"
-    target.write_bytes(b"step")
-    monkeypatch.setattr(
-        engine.cad, tool,
-        lambda *a, **k: pytest.fail("CAD backend must not run before the write gate"),
-    )
-    if tool == "generate_cad_design":
-        result = _generate_cad_design(engine, target, '{"components":[]}')
-    elif tool == "generate_cad_model":
-        result = _generate_cad_model(engine, target, "def gen_step():\n    pass")
-    else:
-        result = _validate_cad_model(engine, target)
-    assert result.startswith("ESCALATION_REQUEST\x1f") or "denied" in result.lower()
 # The CAD contract is injected into the system prompt while the same round
-# filters the tool schema. Those two must agree: the first version named
-# generate_cad_model unconditionally, so a request with no advanced-geometry
-# keyword hid the tool, the model followed the prompt anyway, and the call came
-# back "Unknown tool 'generate_cad_model' - not available."
-GENERATION_TOOLS = ("generate_cad_design", "generate_cad_model")
+# filters the tool schema. Those two must agree: naming a tool the round's
+# schema does not carry makes the model follow the prompt and get back
+# "Unknown tool - not available."
 
 
-@pytest.mark.parametrize("available", [
-    {"create_cad_part", "generate_cad_design", "generate_cad_model"},
-    {"create_cad_part", "generate_cad_design"},
-    {"create_cad_part"},
-    set(),
+@pytest.mark.parametrize("prompt", [
+    "Design a robotic gripper with two jaws and a pin",
+    "Model an 80x50x8 mounting bracket with a 10 mm bore",
+    "Make a flange with a six-hole bolt circle",
+    "Create a 3D printable enclosure for the sensor board",
 ])
-def test_cad_contract_never_names_an_unavailable_generation_tool(engine, available):
-    contract = engine._cad_runtime_instruction(available)
-    for tool in GENERATION_TOOLS:
-        if tool in available:
-            continue
-        directive = [
-            line for line in contract.splitlines()
-            if tool in line and "NOT available" not in line and "Do not call" not in line
-        ]
-        assert not directive, (
-            f"contract directs the model to {tool}, which is not in the round's schema: "
-            f"{directive}"
-        )
+def test_a_mechanical_design_request_reaches_the_supervised_cad_route(engine, prompt):
+    """A CAD request rarely says "CAD".
+
+    Without this the model kept the retired one-shot generators and got no
+    execution contract for exactly the requests this workflow exists to serve.
+    """
+    assert engine._cad_generation_requested([
+        {"role": "user", "content": prompt},
+    ]) is True
 
 
-def test_cad_contract_directs_to_the_declarative_tool_when_it_is_the_only_one(engine):
-    contract = engine._cad_runtime_instruction({"create_cad_part", "generate_cad_design"})
-    assert "use generate_cad_design" in contract
-    assert "generate_cad_model is NOT available" in contract
+@pytest.mark.parametrize("prompt", [
+    "Design a REST API for the billing service",
+    "Create a data model for the user table",
+    "Build the project and run the test suite",
+    "Draw up a plan for next quarter",
+])
+def test_software_work_is_not_mistaken_for_cad(engine, prompt):
+    assert engine._cad_generation_requested([
+        {"role": "user", "content": prompt},
+    ]) is False
 
 
-def test_cad_contract_stops_generation_talk_once_the_retry_budget_is_gone(engine):
-    contract = engine._cad_runtime_instruction({"create_cad_part"})
-    assert "No CAD generation tool is available" in contract
+def test_a_design_verb_continuation_inherits_the_cad_workflow(engine):
+    assert engine._cad_generation_requested([
+        {"role": "user", "content": "Design a robotic gripper"},
+        {"role": "assistant", "content": "The jaw fillet failed."},
+        {"role": "user", "content": "Fix it and continue"},
+    ]) is True
+
+
+def test_one_approval_covers_the_whole_cad_design_not_every_feature(
+        engine, monkeypatch, tmp_path):
+    """A design is one decision for the operator, not thirty prompts.
+
+    The cad_* tools cannot run a shell, reach the network, or write outside the
+    approved workspace, so scoping the grant to the workspace is what makes an
+    incremental session usable in readonly mode at all.
+    """
+    engine.PERMISSION_MODE = "readonly"
+    engine.ARTIFACTS_ROOT = tmp_path
+    engine.ALLOWED_PATHS = [tmp_path]
+    monkeypatch.setattr(engine.cad_mcp.RUNTIME, "begin",
+                        lambda *a, **k: "session started")
+    monkeypatch.setattr(engine.cad_mcp.RUNTIME, "execute",
+                        lambda *a, **k: "registered")
+
+    blocked = engine.exec_tool("cad_begin", json.dumps({"project": "part"}))
+    assert blocked.startswith("ESCALATION_REQUEST")
+    assert "cannot run shell commands" in blocked
+
+    engine.grant_escalation("cad_session")
+    assert "session started" in engine.exec_tool(
+        "cad_begin", json.dumps({"project": "part"}))
+    # Every later modelling step in the approved workspace proceeds.
+    monkeypatch.setattr(engine.cad_mcp.RUNTIME, "workspace", tmp_path / "part")
+    for index in range(3):
+        result = engine.exec_tool("cad_execute", json.dumps(
+            {"code": f"part{index} = Box(1,2,3)"}))
+        assert "registered" in result, result
+
+
+def test_a_new_design_asks_again(engine, monkeypatch, tmp_path):
+    engine.PERMISSION_MODE = "readonly"
+    engine.ARTIFACTS_ROOT = tmp_path
+    engine.ALLOWED_PATHS = [tmp_path]
+    monkeypatch.setattr(engine.cad_mcp.RUNTIME, "begin",
+                        lambda *a, **k: "session started")
+    engine.exec_tool("cad_begin", json.dumps({"project": "first"}))
+    engine.grant_escalation("cad_session")
+    assert "session started" in engine.exec_tool(
+        "cad_begin", json.dumps({"project": "first"}))
+    second = engine.exec_tool("cad_begin", json.dumps({"project": "second"}))
+    assert second.startswith("ESCALATION_REQUEST")
+
+
+def test_read_only_cad_inspection_never_needs_approval(engine, monkeypatch, tmp_path):
+    engine.PERMISSION_MODE = "readonly"
+    engine.ARTIFACTS_ROOT = tmp_path
+    monkeypatch.setattr(engine.cad_mcp.RUNTIME, "state", lambda: "{}")
+    monkeypatch.setattr(engine.cad_mcp.RUNTIME, "measure",
+                        lambda *a, **k: '{"volume": 1}')
+    assert "ESCALATION_REQUEST" not in engine.exec_tool("cad_state", "{}")
+    assert "ESCALATION_REQUEST" not in engine.exec_tool("cad_measure", "{}")
