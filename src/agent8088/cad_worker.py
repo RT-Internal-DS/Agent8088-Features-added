@@ -767,6 +767,11 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
                 request.get("verification"), result, {}, parameters,
                 component_checks=False,
             )
+        elif request.get("verification") is not None:
+            request_verification = _verify_geometry_expectations(
+                request.get("verification"), result, {}, {},
+                component_checks=False,
+            )
 
         # Secondary formats are release artifacts, not debugging evidence. Do
         # not publish them when the canonical STEP fails an assembly or
@@ -802,7 +807,7 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
             **result,
         }
         _write_report(report, report_payload)
-        if action == "generate" and interference.get("interferences"):
+        if interference.get("interferences"):
             pairs = interference["interferences"]
             summaries = []
             for item in pairs[:20]:
@@ -818,7 +823,7 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
                 "report": str(report), "preview": preview_text,
                 "assembly_interference": interference, **result,
             }
-        if action == "generate" and not request_verification["ok"]:
+        if not request_verification["ok"]:
             summaries = []
             for item in request_verification["failures"][:20]:
                 summaries.append(

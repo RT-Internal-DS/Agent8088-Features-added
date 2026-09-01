@@ -2957,7 +2957,7 @@ _CLOSURE_MODES = ("write_text", "shell", "docker", "cron")
 _NON_AUDITABLE_TOOLS = {
     "convert_document", "convert_cad", "validate_cad_model",
     "cad_begin", "cad_execute", "cad_render", "cad_snapshot", "cad_restore",
-    "cad_import", "cad_export",
+    "cad_import", "cad_verify", "cad_export",
 }
 _VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail|unknown)", re.IGNORECASE)
 
@@ -5292,11 +5292,15 @@ def _run_cad_mcp_tool(name: str, args: dict, timeout: int,
                 args.get("parameters"), args.get("requirements"),
             )
         elif name == "cad_execute":
+            if not str(args.get("code") or "").strip():
+                return _tool_arg_missing_error(name, "code")
             result = cad_mcp.RUNTIME.execute(
                 str(args.get("code") or ""), str(args.get("checkpoint") or ""),
             )
         elif name == "cad_state":
             result = cad_mcp.RUNTIME.state()
+        elif name == "cad_guidance":
+            result = cad_mcp.RUNTIME.guidance(str(args.get("topic") or "modeling"))
         elif name == "cad_measure":
             result = cad_mcp.RUNTIME.measure(
                 str(args.get("object_name") or ""), str(args.get("material") or ""),
@@ -5307,6 +5311,8 @@ def _run_cad_mcp_tool(name: str, args: dict, timeout: int,
             )
         elif name == "cad_validate":
             result = cad_mcp.RUNTIME.validate(str(args.get("object_name") or ""))
+        elif name == "cad_verify":
+            result = cad_mcp.RUNTIME.verify(str(args.get("object_name") or ""))
         elif name == "cad_render":
             result = cad_mcp.RUNTIME.render(
                 str(args.get("object_names") or ""),
@@ -7572,6 +7578,9 @@ def _cad_runtime_instruction(available: set[str] | None = None) -> str:
     describing the full toolset unconditionally.
     """
     available = available if available is not None else set()
+    # Keep the availability probe compatible with sessions created by an older
+    # Agent8088 process; cad_verify is an additive bundled gate and cad_export
+    # repeats it automatically in the current runtime.
     session_tools = {"cad_begin", "cad_execute", "cad_measure", "cad_validate",
                      "cad_export"}
     if not session_tools <= available:
@@ -7584,17 +7593,27 @@ def _cad_runtime_instruction(available: set[str] | None = None) -> str:
         "CAD EXECUTION CONTRACT (active for this request):\n"
         f"- Generated files belong in {ARTIFACTS_ROOT}. Never guess another artifacts path.\n"
         "- Start every new design with cad_begin. Put editable dimensions in parameters and "
-        "the user's measurable success criteria in requirements.\n"
+        "the user's measurable success criteria in requirements. Declare requested holes or "
+        "bores as named objects with axis, count, diameter, and depth when known. Apertures "
+        "must remain continuous by default; set continuous=false only for an explicitly "
+        "requested intersecting keyway or slot.\n"
         "- Build incrementally with exactly ONE CAD tool call per response and wait for its "
         "real result. A cad_execute block must add one coherent feature or one component, not "
         "the whole complex model. Register finished shapes with show(shape, 'StableName').\n"
         "- Use actual build123d API: RegularPolygon rather than Hexagon, Vector rather than "
         "Vec, and top-level extrude(profile, amount). Do not invent CAD APIs.\n"
-        "- Call cad_measure after every cut/fuse/intersection. Save cad_snapshot before risky "
+        "- Every successful cad_execute already returns a compact numeric checkpoint. Use "
+        "cad_measure only when you need the full face/hole inventory. Save cad_snapshot before risky "
         "fillets, shells, or booleans. On failure call cad_last_error, restore if necessary, "
         "and repair only the failed feature once.\n"
-        "- Use cad_inspect with request-derived expected dimensions and cad_validate before "
-        "cad_export. Never weaken an expectation to make incorrect geometry pass. "
+        "- Feature order is part of correctness: additive ribs/bosses may cover earlier cuts, "
+        "so reapply final bores and holes after the last additive union. Use cad_guidance with "
+        "topic=modeling or repair instead of inventing APIs.\n"
+        "- Run cad_verify on the final named part or Compound assembly before cad_export. It "
+        "uses immutable request requirements captured at cad_begin, structural validity, and "
+        "a bounded parametric audit. Immutable acceptance and structural failures are blocking; "
+        "parameter brittleness is advisory because coupled parameters are perturbed independently. "
+        "Never weaken an expectation to make incorrect geometry pass. "
         "cad_inspect's expected object accepts only bbox (a 3-number [x,y,z] mm array), "
         "solid_count, holes, bosses, patterns, section_varying, and tolerance; any other "
         "key is rejected. Feature-group expectations are exhaustive, so declare a central "
@@ -7604,7 +7623,7 @@ def _cad_runtime_instruction(available: set[str] | None = None) -> str:
         "with an explicit Pos.\n"
         "- Keep cad_execute blocks geometry-only. Do not print() or call the server's "
         "in-namespace analysis helpers; use the cad_measure/cad_inspect tools instead.\n"
-        "- cad_export is the only completion path: it saves STEP plus requested formats, "
+        "- cad_export is the only completion path and repeats all final gates: it saves STEP plus requested formats, "
         "source, parameters, reports, and preview, then independently reopens the STEP with "
         "text-to-cad. After successful export call open_cad_viewer on the returned STEP.\n"
         "- Do not use execute_shell, run_sandboxed, or write_file for CAD generation. "
@@ -7720,7 +7739,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # once it opens, the model has nothing left to do but summarize.
             round_allowed_tools.difference_update({
                 "cad_begin", "cad_execute", "cad_state", "cad_measure",
-                "cad_inspect", "cad_validate", "cad_render", "cad_snapshot",
+                "cad_guidance", "cad_inspect", "cad_validate", "cad_verify", "cad_render", "cad_snapshot",
                 "cad_restore", "cad_compare", "cad_import", "cad_last_error",
                 "cad_export",
             })
@@ -7859,7 +7878,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if cad_generation:
                 cad_session_names = {
                     "cad_begin", "cad_execute", "cad_state", "cad_measure",
-                    "cad_inspect", "cad_validate", "cad_render", "cad_snapshot",
+                    "cad_guidance", "cad_inspect", "cad_validate", "cad_verify",
+                    "cad_render", "cad_snapshot",
                     "cad_restore", "cad_compare", "cad_import", "cad_last_error",
                     "cad_export", "open_cad_viewer",
                 }

@@ -7,7 +7,6 @@ import pytest
 
 from agent8088 import cad_mcp
 
-
 EMPTY_SEED = (
     "from build123d import *\n"
     "from math import cos, degrees, pi, radians, sin, sqrt, tan\n"
@@ -80,7 +79,8 @@ def test_begin_writes_manifest_and_starts_reduced_supervised_session(runtime, tm
     assert runtime.blocks[0] == (
         "from build123d import *\n"
         "from math import cos, degrees, pi, radians, sin, sqrt, tan\n"
-        "PARAMS = {'width': 20}"
+        "_cad_param_0_width = 20\n"
+        "PARAMS = {'width': _cad_param_0_width}"
     )
     assert "Available PARAMS keys: width" in result
 
@@ -91,6 +91,62 @@ def test_model_style_single_quoted_parameter_objects_are_safe_and_normalised():
     ) == {"plate_od": 120, "ring_positions": [10, 20]}
     with pytest.raises(ValueError, match="must be a JSON object"):
         cad_mcp._json_object("__import__('os').system('echo unsafe')", "parameters")
+
+
+def test_request_friendly_requirements_compile_to_stable_inspect_contract():
+    expected = cad_mcp._requirements_expectation({
+        "bbox": [120, 80, 70],
+        "solid_count": 1,
+        "bearing_bore": {"axis": "Y", "count": 1, "diameter": 35},
+        "mounting_holes": {
+            "axis": "Z", "count": 4, "diameter": 9, "through": True,
+        },
+        "watertight": True,
+    })
+    assert expected == {
+        "bbox": [120, 80, 70],
+        "solid_count": 1,
+        "holes": [
+            {"axis": [0, 1, 0], "count": 1, "diameter": 35},
+            {"axis": [0, 0, 1], "count": 4, "diameter": 9,
+             "bottom": "through"},
+        ],
+    }
+    assert cad_mcp._independent_verification({
+        "bbox": [120, 80, 70], "solid_count": 1,
+    }) == {
+        "overall_bounding_box": {"size": [120, 80, 70]},
+        "solid_count": 1,
+    }
+
+
+def test_parameter_seed_exposes_numeric_dimensions_to_design_audit():
+    seed = cad_mcp._parameter_seed({"width": 20, "ring positions": [10, 30]})
+    assert "_cad_param_0_width = 20" in seed
+    assert "'width': _cad_param_0_width" in seed
+    assert "'ring positions': [10, 30]" in seed
+
+
+def test_aperture_continuity_rejects_partial_cylindrical_faces():
+    expected = {"holes": [{"axis": [0, 0, 1], "count": 1, "diameter": 12}]}
+    inspection = json.dumps({
+        "holes": {"groups": [{
+            "axis": [0, 0, -1], "count": 1, "diameter": 12, "depth": 10,
+        }]},
+        "passes_expectations": True,
+    })
+    full = json.dumps({"face_inventory": [{
+        "type": "Cylinder", "axis": [0, 0, 1], "diameter": 12,
+        "area": 376.991118, "count": 1,
+    }]})
+    partial = json.dumps({"face_inventory": [{
+        "type": "Cylinder", "axis": [0, 0, 1], "diameter": 12,
+        "area": 147.7151, "count": 2,
+    }]})
+    assert cad_mcp._aperture_continuity(expected, inspection, full)[0] is True
+    passed, report = cad_mcp._aperture_continuity(expected, inspection, partial)
+    assert passed is False
+    assert report["checks"][0]["coverage"] < 0.8
 
 
 def test_invalid_begin_does_not_destroy_the_active_session(runtime, tmp_path):
@@ -507,6 +563,44 @@ def test_real_drive_flange_accepts_model_style_params_and_exports_every_format(t
     os.environ.get("AGENT8088_RUN_CAD_E2E") != "1",
     reason="set AGENT8088_RUN_CAD_E2E=1 after installing the isolated CAD runtime",
 )
+def test_real_final_gate_rejects_a_bore_refilled_by_a_later_rib(tmp_path):
+    """A watertight solid is not success when a later union covers a requested bore."""
+    runtime = cad_mcp.CadSessionRuntime()
+    project = tmp_path / "covered_bore"
+    try:
+        runtime.begin(project, "covered_bore", {
+            "length": 60, "width": 40, "thickness": 10,
+            "bore_diameter": 12, "rib_width": 4,
+        }, {
+            "bbox": [60, 40, 10], "solid_count": 1,
+            "central_bore": {"axis": "Z", "count": 1, "diameter": 12},
+        })
+        runtime.execute(
+            "part = Box(PARAMS['length'], PARAMS['width'], PARAMS['thickness'], "
+            "align=(Align.CENTER, Align.CENTER, Align.MIN))\n"
+            "bore = Cylinder(PARAMS['bore_diameter']/2, PARAMS['thickness'], "
+            "align=(Align.CENTER, Align.CENTER, Align.MIN))\n"
+            "part = part - bore\nshow(part, 'Part')"
+        )
+        accepted, report = runtime._acceptance_gate("Part")
+        assert accepted is True, report
+        runtime.execute(
+            "rib = Box(20, PARAMS['rib_width'], PARAMS['thickness'], "
+            "align=(Align.CENTER, Align.CENTER, Align.MIN))\n"
+            "part = part + rib\nshow(part, 'Part')"
+        )
+        result = runtime.export("covered_bore.step", ["step"], "Part")
+        assert "immutable request requirements" in result
+        assert "refused" in result.lower()
+        assert not (project / "covered_bore.step").exists()
+    finally:
+        runtime.close()
+
+
+@pytest.mark.skipif(
+    os.environ.get("AGENT8088_RUN_CAD_E2E") != "1",
+    reason="set AGENT8088_RUN_CAD_E2E=1 after installing the isolated CAD runtime",
+)
 def test_real_complex_multisolid_gripper_replays_and_exports_as_an_assembly(tmp_path):
     """Exercise a complex, incremental, named multi-solid CAD lifecycle."""
     from agent8088 import engine
@@ -527,7 +621,7 @@ def test_real_complex_multisolid_gripper_replays_and_exports_as_an_assembly(tmp_
         begin = engine.exec_tool("cad_begin", json.dumps({
             "project": str(project), "name": "robotic_gripper",
             "parameters": params,
-            "requirements": {"solid_count": 9},
+            "requirements": {"solid_count": 10},
         }))
         assert "Available PARAMS keys: actuator_radius" in begin
 

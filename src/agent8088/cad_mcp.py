@@ -11,6 +11,8 @@ from __future__ import annotations
 import ast
 import atexit
 import json
+import keyword
+import math
 import os
 import queue
 import re
@@ -22,10 +24,9 @@ import time
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from agent8088 import cad
-
 
 BUILD123D_MCP_VERSION = "0.3.83"
 MAX_CODE_BYTES = 24 * 1024
@@ -223,6 +224,269 @@ def _normalise_expectation(value: Any) -> dict:
             "tolerance, for example {\"bbox\": [80, 50, 8], \"solid_count\": 1}."
         )
     return normalised
+
+
+def _parameter_seed(parameters: dict[str, Any]) -> str:
+    """Seed editable values as named literals and through ``PARAMS``.
+
+    build123d-mcp's stable ``design_audit`` intentionally audits top-level
+    numeric assignments.  A single opaque ``PARAMS = {...}`` assignment makes
+    an otherwise parametric model look like it contains only magic constants.
+    The aliases below keep the public PARAMS contract while giving the upstream
+    robustness audit real parameters to perturb.
+    """
+    lines = ["from build123d import *", _MATH_SEED]
+    values: list[str] = []
+    for index, (raw_key, value) in enumerate(parameters.items()):
+        key = str(raw_key)
+        clean = re.sub(r"\W+", "_", key).strip("_")
+        if not clean or clean[0].isdigit() or keyword.iskeyword(clean):
+            clean = f"value_{index}"
+        alias = f"_cad_param_{index}_{clean}"
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            lines.append(f"{alias} = {value!r}")
+            values.append(f"{key!r}: {alias}")
+        else:
+            values.append(f"{key!r}: {value!r}")
+    lines.append("PARAMS = {" + ", ".join(values) + "}")
+    return "\n".join(lines)
+
+
+def _hole_expectation(value: dict[str, Any]) -> dict[str, Any]:
+    """Translate request-friendly hole/bore vocabulary for inspect_part."""
+    aliases = {
+        "diameter_mm": "diameter", "depth_mm": "depth",
+        "holes": "count", "quantity": "count", "number": "count",
+    }
+    group = {
+        aliases.get(str(key).lower(), str(key).lower()): item
+        for key, item in value.items()
+        if str(key).lower() not in {
+            "kind", "name", "label", "continuous", "allow_intersections",
+        }
+    }
+    if group.pop("through", False) and "bottom" not in group:
+        group["bottom"] = "through"
+    return _normalise_group(group)
+
+
+def _requirements_expectation(requirements: Any) -> dict:
+    """Compile immutable user requirements into stable inspect_part checks.
+
+    The model is allowed to describe a bore as ``bearing_bore`` and a mounting
+    pattern as ``mounting_holes``.  The gate, however, is deliberately reduced
+    to build123d-mcp's documented production schema.  Structural validity is
+    checked separately by validate(); these checks answer "is it the requested
+    part?" rather than merely "is it a valid solid?".
+    """
+    source = _json_object(requirements, "requirements")
+    expected: dict[str, Any] = {}
+    holes: list[dict[str, Any]] = []
+
+    for key in ("bbox", "bounding_box", "bounding_box_mm", "dimensions"):
+        if key in source:
+            expected["bbox"] = source[key]
+            break
+    for key in ("solid_count", "solids", "n_solids"):
+        if key in source:
+            expected["solid_count"] = source[key]
+            break
+    if "tolerance" in source:
+        expected["tolerance"] = source["tolerance"]
+
+    direct = source.get("holes")
+    if isinstance(direct, dict):
+        direct = [direct]
+    if isinstance(direct, list):
+        holes.extend(_hole_expectation(item) for item in direct
+                     if isinstance(item, dict))
+
+    reserved = {
+        "bbox", "bounding_box", "bounding_box_mm", "dimensions",
+        "solid_count", "solids", "n_solids", "tolerance", "holes",
+        "features", "manifold", "watertight", "valid",
+    }
+    for key, value in source.items():
+        lowered = str(key).lower()
+        if key not in reserved and isinstance(value, dict) \
+                and ("hole" in lowered or "bore" in lowered):
+            holes.append(_hole_expectation(value))
+
+    features = source.get("features")
+    if isinstance(features, list):
+        for feature in features:
+            if not isinstance(feature, dict):
+                continue
+            kind = str(feature.get("kind") or "").lower()
+            if kind in {"hole", "bore"}:
+                holes.append(_hole_expectation(feature))
+
+    if holes:
+        expected["holes"] = holes
+    return _normalise_expectation(expected) if expected else {}
+
+
+def _independent_verification(requirements: Any) -> dict | None:
+    """Subset text-to-cad can independently prove after reopening STEP."""
+    expected = _requirements_expectation(requirements)
+    verification: dict[str, Any] = {}
+    bbox = expected.get("bbox")
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 3:
+        verification["overall_bounding_box"] = {"size": list(bbox)}
+    elif isinstance(bbox, dict) and set(bbox) == {"x", "y", "z"}:
+        verification["overall_bounding_box"] = {
+            "size": [bbox["x"], bbox["y"], bbox["z"]]
+        }
+    if "solid_count" in expected:
+        verification["solid_count"] = expected["solid_count"]
+    if "tolerance" in expected:
+        verification["tolerance"] = expected["tolerance"]
+    return verification or None
+
+
+def _hole_continuity_flags(requirements: Any) -> list[bool]:
+    """Flags in the same deterministic order as _requirements_expectation holes."""
+    source = _json_object(requirements, "requirements")
+    values: list[dict[str, Any]] = []
+    direct = source.get("holes")
+    if isinstance(direct, dict):
+        direct = [direct]
+    if isinstance(direct, list):
+        values.extend(item for item in direct if isinstance(item, dict))
+    reserved = {
+        "bbox", "bounding_box", "bounding_box_mm", "dimensions",
+        "solid_count", "solids", "n_solids", "tolerance", "holes",
+        "features", "manifold", "watertight", "valid",
+    }
+    for key, value in source.items():
+        lowered = str(key).lower()
+        if key not in reserved and isinstance(value, dict) \
+                and ("hole" in lowered or "bore" in lowered):
+            values.append(value)
+    features = source.get("features")
+    if isinstance(features, list):
+        values.extend(item for item in features if isinstance(item, dict)
+                      and str(item.get("kind") or "").lower() in {"hole", "bore"})
+    return [not (item.get("continuous") is False
+                 or item.get("allow_intersections") is True) for item in values]
+
+
+def _json_report(payload: str) -> dict:
+    """Decode a JSON tool result that may have a one-line human summary."""
+    text = str(payload or "").strip()
+    for index, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            value = json.loads(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _expectations_pass(payload: str) -> bool:
+    report = _json_report(payload)
+    if not report:
+        return False
+    if report.get("passes_expectations") is not None:
+        return bool(report["passes_expectations"])
+    status = str(report.get("status") or "").upper()
+    return status == "PASS" and not report.get("mismatches")
+
+
+def _axis_signature(value: Any) -> tuple[float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return None
+    try:
+        vector = [float(item) for item in value]
+        length = math.sqrt(sum(item * item for item in vector))
+        if length <= 1e-9:
+            return None
+        # A hole's +axis and -axis describe the same cylindrical aperture.
+        normal = [round(abs(item / length), 3) for item in vector]
+        return tuple(normal)
+    except (TypeError, ValueError):
+        return None
+
+
+def _aperture_continuity(expected: dict, inspection: str, measurement: str,
+                         continuity_flags: list[bool] | None = None
+                         ) -> tuple[bool, dict]:
+    """Prove recognised holes still have a complete cylindrical aperture.
+
+    inspect_part can recognise two surviving arcs as a hole after a later rib
+    crosses the opening.  The exact B-rep face inventory exposes that defect:
+    its combined cylindrical lateral area is smaller than pi*d*depth.  This is
+    a deterministic independent check over the final revision, not an LLM
+    visual judgement.
+    """
+    requested = expected.get("holes")
+    if not requested:
+        return True, {"provided": False, "checks": []}
+    inspected = _json_report(inspection)
+    measured = _json_report(measurement)
+    found = ((inspected.get("holes") or {}).get("groups")
+             if isinstance(inspected.get("holes"), dict) else []) or []
+    inventory = measured.get("face_inventory") or []
+    checks: list[dict[str, Any]] = []
+    ok = True
+    for requirement_index, requirement in enumerate(requested):
+        if not isinstance(requirement, dict):
+            continue
+        diameter = requirement.get("diameter")
+        count = int(requirement.get("count") or 1)
+        axis = _axis_signature(requirement.get("axis"))
+        if diameter is None or axis is None:
+            continue
+        diameter = float(diameter)
+        if continuity_flags is not None and requirement_index < len(continuity_flags) \
+                and not continuity_flags[requirement_index]:
+            checks.append({
+                "diameter": diameter, "axis": list(axis), "count": count,
+                "skipped": True,
+                "reason": "request explicitly allows this aperture to intersect another feature",
+                "ok": True,
+            })
+            continue
+        matching_groups = [group for group in found if isinstance(group, dict)
+                           and abs(float(group.get("diameter") or -1) - diameter) <= 0.1
+                           and _axis_signature(group.get("axis")) == axis]
+        depth = None
+        for group in matching_groups:
+            if group.get("depth") is not None:
+                depth = float(group["depth"])
+                break
+        if requirement.get("depth") is not None:
+            depth = float(requirement["depth"])
+        lateral_area = 0.0
+        for face in inventory:
+            if not isinstance(face, dict) or face.get("type") != "Cylinder":
+                continue
+            if abs(float(face.get("diameter") or -1) - diameter) > 0.1:
+                continue
+            if _axis_signature(face.get("axis")) != axis:
+                continue
+            lateral_area += float(face.get("area") or 0) * int(face.get("count") or 1)
+        if not depth or depth <= 0:
+            check_ok = False
+            coverage = None
+            expected_area = None
+        else:
+            expected_area = math.pi * diameter * depth * count
+            coverage = lateral_area / expected_area if expected_area else 0.0
+            # OCCT analytical cylinder areas are exact to well below 1%; leave
+            # 3% for STEP round-tripping and split seam faces.
+            check_ok = 0.97 <= coverage <= 1.03
+        ok = ok and check_ok
+        checks.append({
+            "diameter": diameter, "axis": list(axis), "count": count,
+            "depth": depth, "expected_lateral_area": expected_area,
+            "actual_lateral_area": lateral_area, "coverage": coverage,
+            "ok": check_ok,
+        })
+    return ok, {"provided": bool(checks), "checks": checks, "ok": ok}
 
 
 def _failed(text: str) -> bool:
@@ -580,6 +844,19 @@ class _StdioMCP:
             return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
         return self._content_text(result)
 
+    def read_resource(self, uri: str, timeout: int | None = None) -> str:
+        """Read a server-owned modelling guide without exposing arbitrary RPC."""
+        result = self.request("resources/read", {"uri": str(uri)}, timeout)
+        parts: list[str] = []
+        for item in result.get("contents", []):
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        if not parts:
+            raise CadToolError(f"build123d-mcp resource is unavailable: {uri}")
+        return "\n".join(parts)
+
     def _detail(self, name: str, text: str, mark: int = 0) -> str:
         """Recover the cause when MCP masks an unexpected tool exception.
 
@@ -663,10 +940,18 @@ class _StdioMCP:
 class CadSessionRuntime:
     """One bounded, replayable CAD session owned by Agent8088."""
 
-    REQUIRED_TOOLS = {
+    REQUIRED_TOOLS: ClassVar[set[str]] = {
         "execute", "session_state", "measure", "inspect_part", "validate",
         "render_view", "save_snapshot", "restore_snapshot", "compare", "export",
         "import_cad_file", "last_error", "script", "health_check", "reset", "version",
+        "design_audit",
+    }
+
+    GUIDANCE_RESOURCES: ClassVar[dict[str, str]] = {
+        "modeling": "build123d://skill/modeling",
+        "repair": "build123d://skill/repair",
+        "quickref": "build123d://quickref",
+        "selectors": "build123d://selectors",
     }
 
     def __init__(self):
@@ -778,11 +1063,7 @@ class CadSessionRuntime:
             # supported modelling API once so the first feature can use Box,
             # Cylinder, Pos, etc. without spending a fragile extra model turn on
             # an import.  This block is replayed after supervised restarts too.
-            parameter_code = (
-                "from build123d import *\n"
-                f"{_MATH_SEED}\n"
-                "PARAMS = " + repr(self.parameters)
-            )
+            parameter_code = _parameter_seed(self.parameters)
             parameter_result = self._call(
                 "execute", {"code": parameter_code}, retry=False
             )
@@ -806,9 +1087,9 @@ class CadSessionRuntime:
             return (
                 f"CAD session {self.session_id[:8]} started in {self.workspace}. "
                 f"build123d-mcp: {version.strip()}. Build incrementally with cad_execute; "
-                "call cad_measure after booleans and cad_validate before cad_export.\n"
+                "each successful feature returns an automatic numeric checkpoint.\n"
                 f"Available PARAMS keys: {parameter_keys}.\n"
-                f"Acceptance requirement keys: {requirement_keys}."
+                f"Immutable acceptance requirement keys: {requirement_keys}."
             )
 
     def execute(self, code: str, checkpoint: str = "") -> str:
@@ -837,6 +1118,19 @@ class CadSessionRuntime:
         self.blocks.append(str(code))
         if checkpoint:
             output = output + "\n" + self.snapshot(checkpoint)
+        # A numeric checkpoint is cheaper and more reliable than spending a
+        # separate model turn asking for cad_measure after every successful
+        # boolean. Keep the full inventory available through cad_measure, but
+        # put the critical volume/bbox delta in the same transaction result.
+        try:
+            checkpoint_metrics = _metrics(self._call(
+                "measure", {"object_name": "", "material": ""}
+            ))
+        except CadMCPError:
+            checkpoint_metrics = {}
+        if checkpoint_metrics:
+            output += ("\nAutomatic numeric checkpoint: "
+                       + json.dumps(checkpoint_metrics, separators=(",", ":")))
         return output
 
     def _parameter_hint(self) -> str:
@@ -861,6 +1155,121 @@ class CadSessionRuntime:
 
     def validate(self, object_name: str = "") -> str:
         return self._call("validate", {"object_name": object_name})
+
+    def guidance(self, topic: str = "modeling") -> str:
+        self._require_active()
+        key = str(topic or "modeling").strip().lower()
+        uri = self.GUIDANCE_RESOURCES.get(key)
+        if not uri:
+            raise CadMCPError(
+                "Unknown CAD guidance topic. Use modeling, repair, quickref, or selectors."
+            )
+        with self._lock:
+            if not self._rpc:
+                self._start(replay=bool(self.blocks))
+            return self._rpc.read_resource(uri, timeout=30)
+
+    def _acceptance_gate(self, object_name: str, rpc: _StdioMCP | None = None
+                         ) -> tuple[bool, str]:
+        """Check the final revision against requirements captured at cad_begin."""
+        expected = _requirements_expectation(self.requirements)
+        if not expected:
+            return True, "No measurable immutable acceptance requirements were supplied."
+        target = str(object_name or "").strip()
+        call = rpc.call_tool if rpc else self._call
+        if target == "*":
+            names = self._registered_objects() if rpc is None else []
+            measurable = set(expected) - {"solid_count", "tolerance"}
+            if measurable:
+                return False, (
+                    "Feature-level acceptance cannot target '*'. Register the final part or "
+                    "assembly with show(final_shape, 'StableName') and export that name."
+                )
+            wanted = expected.get("solid_count")
+            if wanted is not None and names:
+                actual_solids = 0
+                per_object: dict[str, int] = {}
+                for name in names:
+                    validation = _json_report(self.validate(name))
+                    count = int(validation.get("n_solids") or 0)
+                    per_object[name] = count
+                    actual_solids += count
+                passed = int(wanted) == actual_solids
+                return passed, json.dumps({
+                    "status": "PASS" if passed else "FAIL",
+                    "expected_solid_count": int(wanted),
+                    "actual_solid_count": actual_solids,
+                    "registered_object_count": len(names),
+                    "objects": per_object,
+                })
+            return False, "Cannot prove whole-assembly acceptance without a named final assembly."
+        report = call("inspect_part", {
+            "object_name": target,
+            "expected": json.dumps(expected, separators=(",", ":")),
+        })
+        measured = call("measure", {"object_name": target, "material": ""})
+        continuous, aperture = _aperture_continuity(
+            expected, report, measured, _hole_continuity_flags(self.requirements)
+        )
+        combined = report + "\nAperture continuity:\n" + json.dumps(
+            aperture, indent=2, allow_nan=False
+        )
+        return _expectations_pass(report) and continuous, combined
+
+    def verify(self, object_name: str = "") -> str:
+        """Bundle intent, structural, and parametric checks for the final revision."""
+        self._require_active()
+        target = str(object_name or "").strip()
+        if not target:
+            names = self._registered_objects()
+            if len(names) != 1:
+                raise CadMCPError(
+                    "cad_verify needs object_name because the session contains: "
+                    + ", ".join(names)
+                )
+            target = names[0]
+        accepted, acceptance = self._acceptance_gate(target)
+        valid = self.validate(target)
+        structurally_valid = '"passes_gate": true' in valid.lower()
+        audit = self._call("design_audit", {"epsilon": 0.1, "max_params": 8},
+                           timeout=300)
+        audit_report = _json_report(audit)
+        summary = audit_report.get("summary") if isinstance(audit_report, dict) else {}
+        brittle = int((summary or {}).get("brittle") or 0)
+        passed = accepted and structurally_valid
+        verdict = ("PASS WITH PARAMETRIC WARNINGS" if passed and brittle
+                   else "PASS" if passed else "FAIL")
+        inspection_text, _, aperture_text = acceptance.partition(
+            "\nAperture continuity:\n"
+        )
+        inspection = _json_report(inspection_text)
+        aperture = _json_report(aperture_text)
+        validity = _json_report(valid)
+        compact = {
+            "immutable_request_acceptance": {
+                "passed": accepted,
+                "bbox": inspection.get("bbox"),
+                "topology": inspection.get("topology"),
+                "holes": inspection.get("holes"),
+                "bosses": inspection.get("bosses"),
+                "patterns": inspection.get("patterns"),
+                "mismatches": inspection.get("mismatches") or [],
+            },
+            "aperture_continuity": aperture,
+            "structural_validity": {
+                "passed": structurally_valid,
+                "n_solids": validity.get("n_solids"),
+                "open_edges": validity.get("open_edges"),
+                "nonmanifold_edges": validity.get("nonmanifold_edges"),
+                "overlapping_pairs": validity.get("overlapping_pairs"),
+                "reasons": validity.get("reasons") or [],
+            },
+            "parametric_robustness_advisory": summary or {
+                "note": "audit returned no structured summary",
+            },
+        }
+        return (f"CAD final verification: {verdict}\n"
+                + json.dumps(compact, indent=2, allow_nan=False))
 
     def render(self, object_names: str = "", direction: str = "iso") -> str:
         self._require_active()
@@ -1045,6 +1454,26 @@ class CadSessionRuntime:
                     raise CadMCPError(
                         f"clean-process replay of {name} failed the validity gate"
                     )
+            if object_name != "*":
+                expected = _requirements_expectation(self.requirements)
+                if expected:
+                    accepted = rpc.call_tool("inspect_part", {
+                        "object_name": object_name,
+                        "expected": json.dumps(expected, separators=(",", ":")),
+                    })
+                    measured = rpc.call_tool("measure", {
+                        "object_name": object_name, "material": "",
+                    })
+                    continuous, aperture = _aperture_continuity(
+                        expected, accepted, measured,
+                        _hole_continuity_flags(self.requirements),
+                    )
+                    if not _expectations_pass(accepted) or not continuous:
+                        raise CadMCPError(
+                            "clean-process replay no longer satisfies the immutable "
+                            "request requirements: " + accepted[:1000]
+                            + " aperture continuity: " + json.dumps(aperture)[:600]
+                        )
         finally:
             rpc.stop()
         return (f"replayed {len(self.blocks)} operation(s) in a clean build123d-mcp "
@@ -1092,9 +1521,24 @@ class CadSessionRuntime:
         requested = _formats(formats)
         stem = _safe_name(Path(str(filename or self.name)).stem, self.name)
 
+        accepted, acceptance = self._acceptance_gate(object_name)
+        if not accepted:
+            return ("CAD export refused because the final revision does not satisfy "
+                    "the immutable request requirements:\n" + acceptance)
+
         passed, validation = self._validation_gate(object_name)
         if not passed:
             return "CAD export refused because validation did not pass:\n" + validation
+
+        audit = self._call("design_audit", {"epsilon": 0.1, "max_params": 8},
+                           timeout=300)
+        # Robustness perturbation is advisory at export. A valid nominal design
+        # can legitimately have coupled domains (for example, increasing bolt
+        # circle 10% while holding flange diameter fixed moves holes off-edge).
+        # The audit cannot infer those parameter constraints, so treating every
+        # brittle perturbation as a release blocker creates a false failure.
+        # Baseline validity and immutable request acceptance remain hard gates;
+        # the full audit stays in the report for engineering review.
 
         targets = ([object_name] if object_name != "*"
                    else self._registered_objects())
@@ -1144,7 +1588,10 @@ class CadSessionRuntime:
 
             step_path = next(path for path in exported
                              if path.suffix.lower() == ".step")
-            independent = cad.validate_cad_model(step_path, render=True, timeout=300)
+            independent = cad.validate_cad_model(
+                step_path, render=True, timeout=300,
+                verification=_independent_verification(self.requirements),
+            )
             if independent.startswith("CAD validation failed"):
                 raise CadMCPError("Independent text-to-cad validation failed: " + independent)
 
@@ -1155,11 +1602,13 @@ class CadSessionRuntime:
                 "formats": [path.suffix.lstrip(".") for path in exported],
                 "parameters": self.parameters,
                 "requirements": self.requirements,
+                "immutable_acceptance": acceptance,
                 "objects": targets,
                 "imported_geometry": list(self.imports),
                 "committed_operations": len(self.blocks),
                 "analysis_calls_dropped_from_source": sorted(set(dropped)),
                 "mcp_validation": validation,
+                "parametric_robustness_audit": audit,
                 "clean_process_replay": fresh,
                 "canonical_source_replay": constrained,
                 "canonical_source_replay_strict": strict,

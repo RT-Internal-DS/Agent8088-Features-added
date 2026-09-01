@@ -64,6 +64,7 @@ def test_supervised_cad_mcp_tools_publish_small_structured_surface(engine):
     assert all(engine.TOOL_SPECS[name]["mode"] == "cad_mcp" for name in expected)
     assert engine.TOOL_SPECS["cad_state"]["cad_read_only"] is True
     assert engine.TOOL_SPECS["cad_execute"]["cad_read_only"] is False
+    assert engine.TOOL_SPECS["cad_verify"]["cad_read_only"] is True
     definitions = {
         item["function"]["name"]: item["function"]["parameters"]
         for item in engine.build_tools_def(engine.TOOL_SPECS)
@@ -89,6 +90,21 @@ def test_cad_mcp_dispatch_passes_structured_values_to_owned_runtime(engine, monk
     assert "started" in result
     assert seen["workspace"] == engine.ARTIFACTS_ROOT / "mcp-unit"
     assert seen["parameters"] == {"width": 20}
+
+
+def test_empty_cad_execute_is_a_recoverable_missing_argument(engine, monkeypatch):
+    engine.PERMISSION_MODE = "full-auto"
+    called = False
+
+    def execute(*args, **kwargs):
+        nonlocal called
+        called = True
+        return "should not run"
+
+    monkeypatch.setattr(engine.cad_mcp.RUNTIME, "execute", execute)
+    result = engine.exec_tool("cad_execute", "{}")
+    assert "no arguments" in result.lower() and "code" in result.lower()
+    assert called is False
 
 
 def test_cad_generation_request_disables_generic_execution_and_injects_real_artifacts_path(
@@ -261,8 +277,9 @@ def test_successful_cad_export_latches_completion_and_prevents_duplicate_rebuild
 
     monkeypatch.setattr(engine, "exec_tool", execute)
     cad_names = {
-        "cad_begin", "cad_execute", "cad_state", "cad_measure", "cad_inspect",
-        "cad_validate", "cad_render", "cad_snapshot", "cad_restore", "cad_compare",
+        "cad_begin", "cad_execute", "cad_guidance", "cad_state", "cad_measure",
+        "cad_inspect", "cad_validate", "cad_verify", "cad_render", "cad_snapshot",
+        "cad_restore", "cad_compare",
         "cad_import", "cad_last_error", "cad_export", "open_cad_viewer",
     }
     tools = [{"type": "function", "function": {"name": name}}

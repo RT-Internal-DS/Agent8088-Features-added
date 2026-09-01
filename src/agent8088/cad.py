@@ -612,7 +612,8 @@ def generate_cad_model(path, source: str, parameters: str = "{}",
 
 
 
-def validate_cad_model(path, render: bool = True, timeout: int = 300) -> str:
+def validate_cad_model(path, render: bool = True, timeout: int = 300,
+                       verification: dict | None = None) -> str:
     """Reopen, validate and optionally render an existing STEP model."""
     path = Path(path)
     if not path.exists():
@@ -624,6 +625,7 @@ def validate_cad_model(path, render: bool = True, timeout: int = 300) -> str:
         "report": str(report.resolve()),
         "preview": str(preview.resolve()) if preview else "",
         "workspace": str(path.parent.resolve()),
+        "verification": verification,
     }, timeout=timeout)
     if not result.get("ok"):
         return _worker_failure("CAD validation failed", result)

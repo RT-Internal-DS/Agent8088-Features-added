@@ -21,13 +21,20 @@ session is the only route. Never claim success from an exit code.
 2. Call `cad_begin` once with a short artifact-directory name.
 3. Call `cad_execute` with one coherent feature or component only. Wait for its result.
 4. Register meaningful geometry with `show(shape, "StableName")`.
-5. Call `cad_measure` after every boolean operation.
+5. Read the automatic compact numeric checkpoint returned by every successful
+   `cad_execute`. Call `cad_measure` only when the full face inventory is needed.
 6. Save `cad_snapshot` before risky fillets, shells, lofts, or complex booleans.
 7. Repeat one tool call per model response until construction is complete.
-8. Call `cad_inspect` with request-derived expectations.
-9. Call `cad_validate`. Repair any failure; never weaken the requested checks.
-10. Call `cad_render` for an isometric preview.
-11. Call `cad_export` for STEP and requested secondary formats. This saves source,
+8. Call `cad_verify` on the final named part or final Compound assembly. It checks
+   the current revision against immutable request requirements, structural
+   validity, aperture continuity, and parametric robustness. Treat robustness
+   brittleness as an advisory warning because independently perturbed coupled
+   parameters can create false failures; request and structural failures remain
+   blocking.
+9. Repair any failure; never weaken the requested checks.
+10. Call `cad_render` for an isometric preview and inspect it for gross errors.
+11. Call `cad_export` for STEP and requested secondary formats. Export repeats all
+    deterministic gates and saves source,
     parameters, reports, and preview, then independently reopens the STEP through
     text-to-cad.
 12. Call `open_cad_viewer` on the exported STEP unless the user declined visual review.
@@ -58,6 +65,16 @@ Use:
 Prefer simple, inspectable construction steps. Reuse variables already present in
 the persistent session rather than resending prior code.
 
+When unsure about feature ordering or a failed boolean, call
+`cad_guidance(topic="modeling")` or `cad_guidance(topic="repair")`. These read the
+approved guidance bundled with the installed build123d-mcp version. Do not pass a
+`build123d://...` URI to `view_skill` or invent a replacement API.
+
+Feature order is part of correctness. Additive ribs, bosses, pads, and fused
+components can refill or obstruct a hole cut earlier. After the final additive
+union, reapply bores, mounting holes, slots, and other openings that must remain
+clear, then run `cad_verify`. Never assume an earlier successful cut remains valid.
+
 `cad_execute` blocks must **build geometry only**. Read the model with the
 `cad_measure`, `cad_inspect`, `cad_validate`, and `cad_compare` tools instead of
 `print(...)` or the server's in-namespace analysis helpers (`measure`,
@@ -67,7 +84,7 @@ the live session and downgrades the strict export gate.
 
 ## Measuring and checking
 
-- `cad_measure` reports volume, area, bounding box, centre of mass, and
+- The automatic checkpoint and `cad_measure` report volume, area, bounding box, centre of mass, and
   face/edge/vertex counts. It does **not** report a solid count.
 - `cad_validate` reports `n_solids` plus watertight/manifold/B-rep status.
 - `cad_inspect` compares the model to expectations. Its `expected` object accepts
@@ -102,11 +119,12 @@ Build and `show()` each component under a stable name. Measure parts after
 construction and use `cad_compare(kind="fit")` for clearances or unintended
 interference.
 
-Export an assembly with `cad_export(object_name="*")`: every registered object is
-validated individually and the STEP contains all of them. Because `*` means
-*everything currently registered*, do not leave scratch geometry under a `show()`
-name — either give the intermediate a throwaway variable and no `show()`, or
-overwrite the name once the final version exists.
+Prefer creating one final `Compound(children=[...], label="Assembly")`, register it
+as `show(assembly, "Assembly")`, and export that explicit name. `object_name="*"`
+remains available for deliberately separate registered components, but means
+everything currently registered. Do not leave scratch geometry under a `show()`
+name. Keep intermediates unregistered, overwrite a stable name, or build the final
+Compound.
 
 Do not write an entire robot, house, telescope, or assembly in one tool call.
 Large requests must be decomposed into feature clusters so model output stays well
@@ -144,11 +162,15 @@ previously successful blocks. Do not blindly repeat a timed-out operation.
 
 ## Output contract
 
-`cad_export` publishes nothing until every gate passes. It stages the files, then
-requires: the MCP validity gate on each exported object, a clean-process rebuild
-of the recorded operations whose geometry matches the live session exactly, a
-replay of the generated `gen_step()` source where the constrained generator can
-run it, and an independent text-to-cad reopen of the STEP.
+`cad_export` publishes nothing until every required gate passes. It stages the files, then
+requires: immutable request acceptance on the final revision, cylindrical-aperture
+continuity for declared bores and holes, the MCP validity gate, a clean-process
+rebuild whose geometry and
+request checks match the live session, a replay of the generated `gen_step()`
+source where the constrained generator can run it, and an independent text-to-cad
+reopen of the STEP with its own envelope/solid-count checks and snapshot.
+The bounded upstream parameter robustness audit is recorded alongside these
+results as advisory evidence rather than a release blocker.
 
 The published bundle is canonical STEP, the requested STL/3MF, the generated
 `<design>.step.py` source, the committed `<design>.cad.py` transaction log,
