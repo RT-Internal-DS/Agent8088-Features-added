@@ -629,7 +629,8 @@ _env_permission_mode = os.environ.get("AGENT8088_PERMISSION", "readonly")
 PERMISSION_MODE = "readonly" if _env_permission_mode == "plan-only" else _env_permission_mode
 _one_shot_grant = False  # exact tool-call key, or True for direct embedding grants
 # Workspace of the CAD design the operator has approved for this user turn.
-# Scoped, not session-wide: cleared on a new user turn and on every cad_begin.
+# Scoped, not session-wide: cleared on a new user turn. A different cad_begin
+# workspace naturally misses the equality check and asks again.
 _cad_session_grant = ""
 _pending_approval_key = ""
 _local_fallback_grant = False
@@ -5252,9 +5253,6 @@ def _run_cad_mcp_tool(name: str, args: dict, timeout: int,
             return f"Error: CAD import path is blocked: {import_path}"
 
     global _cad_session_grant
-    if name == "cad_begin":
-        # A new job re-asks: an approval is for one design in one directory.
-        _cad_session_grant = ""
 
     display = f"CAD session: {workspace}"
     # One CAD design is one operation to a person, not thirty. Approval is scoped
@@ -7479,7 +7477,7 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
 
 CLI_ANYTHING_MIN_TURNS = 20
 CLI_ANYTHING_MAX_TURNS = 60
-CAD_PROJECT_MIN_TURNS = 24  # retained name for compatibility; now MCP session turns
+CAD_PROJECT_MIN_TURNS = 48  # retained name for compatibility; now MCP session turns
 CLI_ANYTHING_EXTENSION_TURNS = 5
 
 
@@ -7676,7 +7674,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     search_results = {}  # query signature -> that search's output, for reuse
     forced_stop = False
     cad_failures = 0
-    cad_generation_stopped = False
+    cad_transport_stopped = False
+    cad_export_completed = False
+    cad_viewer_opened = False
 
     # Fast path: a request for internal instructions/config is a policy refusal —
     # answer it immediately instead of burning turns and tokens to reach the same "no".
@@ -7709,16 +7709,43 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             round_allowed_tools.difference_update({
                 "execute_shell", "run_sandboxed", "write_file",
             })
-        if cad_generation_stopped:
+        if cad_transport_stopped:
             round_allowed_tools.difference_update({
                 "cad_begin", "cad_execute", "cad_export",
             })
+        if cad_export_completed:
+            # Export is the verified commit point.  Starting or mutating another
+            # CAD session after it creates duplicate artifacts and can overwrite
+            # a completed design.  Keep only the viewer for one exact-path retry;
+            # once it opens, the model has nothing left to do but summarize.
+            round_allowed_tools.difference_update({
+                "cad_begin", "cad_execute", "cad_state", "cad_measure",
+                "cad_inspect", "cad_validate", "cad_render", "cad_snapshot",
+                "cad_restore", "cad_compare", "cad_import", "cad_last_error",
+                "cad_export",
+            })
+            if cad_viewer_opened:
+                round_allowed_tools.discard("open_cad_viewer")
         round_tools_def = _filter_tool_definitions(round_tools_def, round_allowed_tools)
         round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
-        if cad_generation:
+        if cad_generation and not cad_export_completed:
             round_system_prompt = (
                 (round_system_prompt or current_system_prompt())
                 + "\n\n" + _cad_runtime_instruction(round_allowed_tools)
+            )
+        elif cad_generation:
+            completion_instruction = (
+                "CAD COMPLETION CONTRACT: the verified export has already completed. "
+                + ("The integrated viewer is open. Give the user the concise final "
+                   "artifact/verification summary now; do not start another CAD session."
+                   if cad_viewer_opened else
+                   "Call open_cad_viewer at most once using the exact STEP path returned "
+                   "by cad_export. If it fails, correct only that path. Then give the final "
+                   "artifact/verification summary; do not start another CAD session.")
+            )
+            round_system_prompt = (
+                (round_system_prompt or current_system_prompt())
+                + "\n\n" + completion_instruction
             )
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
@@ -8014,15 +8041,38 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 if (result.startswith(("CAD generation failed", "CAD design generation failed", "Error:"))
                         or "Use cad_last_error" in plain_cad_result):
                     cad_failures += 1
-                    if cad_failures >= 2:
-                        cad_generation_stopped = True
+                    # NameError, KeyError and rejected booleans are feature-level
+                    # authoring failures in an incremental session, not proof that
+                    # the CAD runtime is broken.  The old one-shot breaker removed
+                    # cad_execute after two such mistakes, making the required
+                    # repair impossible.  Only a failed supervised restart or a
+                    # missing runtime removes mutating CAD tools; ordinary feature
+                    # errors remain recoverable within the bounded turn/call limits.
+                    transport_failure = any(marker in plain_cad_result for marker in (
+                        "Advanced CAD MCP runtime is unavailable",
+                        "CAD MCP operation failed after supervised restart",
+                        "build123d-mcp is missing required tools",
+                    ))
+                    if transport_failure:
+                        cad_transport_stopped = True
                         result += (
-                            "\nCAD retry budget exhausted after two failed operations. "
-                            "Do not keep generating variants; restore the last checkpoint or "
-                            "report the latest specific failure and preserved artifacts."
+                            "\nThe supervised CAD transport is unavailable for this turn. "
+                            "Preserved session artifacts may still be inspected."
+                        )
+                    elif cad_failures >= 2:
+                        result += (
+                            "\nMultiple CAD feature operations have failed, but cad_execute "
+                            "remains available. Call cad_last_error, inspect the exact PARAMS "
+                            "keys/session state, restore a checkpoint if needed, and make one "
+                            "targeted correction instead of regenerating the whole model."
                         )
                 else:
                     cad_failures = 0
+            plain_result = _unwrap_untrusted(result)
+            if name == "cad_export" and "CAD export completed" in plain_result:
+                cad_export_completed = True
+            elif name == "open_cad_viewer" and plain_result.lstrip().startswith("Opened:"):
+                cad_viewer_opened = True
             if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
                 # Remember what this query returned so a reworded repeat can be
                 # answered from it. An escalation is not a result — recording it

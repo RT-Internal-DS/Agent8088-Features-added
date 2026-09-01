@@ -251,7 +251,11 @@ Write-Output (Write-Agent8088Launcher -AgentExe '{str(fake_agent).replace("'", "
         # Leave enough room for a cold Windows PowerShell 5.1 startup before the
         # waiter begins repainting; otherwise a heavily loaded CI host can delete
         # the directory before the first frame is emitted.
-        time.sleep(3.0)
+        # A full parallel-ish suite leaves enough CPU/IO pressure that spawning
+        # Windows PowerShell 5.1 can exceed three seconds even though this test
+        # passes alone. Keep the marker alive long enough to observe multiple
+        # forced spinner frames without weakening the user-visible assertion.
+        time.sleep(7.0)
         shutil.rmtree(agent_root)
         marker.unlink()
 

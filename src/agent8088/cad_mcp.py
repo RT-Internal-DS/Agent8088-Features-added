@@ -35,6 +35,7 @@ _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 _SUPPORTED_FORMATS = {"step", "stl", "3mf"}
 _IMPORTABLE_SUFFIXES = {".step", ".stp", ".stl", ".3mf"}
 _MASKED_TOOL_ERROR = re.compile(r"^Error executing tool [A-Za-z0-9_]+:?\s*$")
+_MATH_SEED = "from math import cos, degrees, pi, radians, sin, sqrt, tan"
 
 # Primitives that only exist inside the MCP execute namespace. They report on
 # geometry rather than build it, so the canonical source drops the bare calls
@@ -131,17 +132,42 @@ def _formats(value: Any) -> list[str]:
 
 
 def _json_object(value: Any, label: str) -> dict:
+    """Return a bounded JSON-compatible object from model-emitted input.
+
+    Native tool calling normally supplies a ``dict``.  Text-mode models
+    occasionally wrap that object in a string and use Python's single-quoted
+    literal spelling.  Treating that harmless representation difference as a
+    lost CAD session caused the model to retry ``cad_begin`` with no parameters
+    at all.  ``ast.literal_eval`` is deliberately the only fallback: it accepts
+    data literals without executing names, calls, attributes, or imports.
+    The JSON round trip then rejects non-finite/non-serializable values and
+    normalises tuples to arrays before anything reaches the MCP child.
+    """
     if value in (None, ""):
         return {}
     if isinstance(value, dict):
-        return value
-    try:
-        parsed = json.loads(str(value))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"{label} must be valid JSON: {exc}") from exc
+        parsed = value
+    else:
+        raw = str(value).strip()
+        if len(raw.encode("utf-8")) > MAX_CODE_BYTES:
+            raise ValueError(f"{label} object is too large")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as json_exc:
+            try:
+                parsed = ast.literal_eval(raw)
+            except (SyntaxError, ValueError, TypeError, MemoryError) as literal_exc:
+                raise ValueError(
+                    f"{label} must be a JSON object (single-quoted data literals "
+                    f"are also accepted): {json_exc}"
+                ) from literal_exc
     if not isinstance(parsed, dict):
         raise ValueError(f"{label} must be a JSON object")
-    return parsed
+    try:
+        encoded = json.dumps(parsed, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must contain only JSON-compatible values: {exc}") from exc
+    return json.loads(encoded)
 
 
 def _normalise_group(group: Any) -> Any:
@@ -274,9 +300,18 @@ def _geometry_statements(blocks: list[str]) -> tuple[list[str], list[str]]:
             if name in _SESSION_ONLY_NAMES:
                 dropped.append(name)
                 continue
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if any(isinstance(target, ast.Name) and target.id == "PARAMS"
+                       for target in targets):
+                    continue
             if (isinstance(node, ast.ImportFrom) and node.module == "build123d"
                     and any(alias.name == "*" for alias in node.names)):
                 continue
+            if isinstance(node, ast.ImportFrom) and node.module == "math":
+                seeded = {"cos", "degrees", "pi", "radians", "sin", "sqrt", "tan"}
+                if all(alias.name in seeded for alias in node.names):
+                    continue
             if isinstance(node, ast.Import) and any(
                     alias.name == "build123d" for alias in node.names):
                 continue
@@ -360,7 +395,8 @@ def _canonical_source(statements: list[str], object_name: str) -> str:
     else:
         return_line = "    return list(_shown.values())[-1]"
     return (
-        "from build123d import *\n\n"
+        "from build123d import *\n"
+        f"{_MATH_SEED}\n\n"
         "def gen_step():\n"
         "    _shown = {}\n"
         "    def show(shape, name='shape'):\n"
@@ -719,13 +755,17 @@ class CadSessionRuntime:
     # ------------------------------------------------------------ session
     def begin(self, workspace: Path, name: str, parameters: Any = None,
               requirements: Any = None) -> str:
+        # Parse first.  An invalid retry must not tear down a healthy session or
+        # leave a half-initialised workspace behind.
+        parsed_parameters = _json_object(parameters, "parameters")
+        parsed_requirements = _json_object(requirements, "requirements")
         with self._lock:
             self.close()
             self.workspace = Path(workspace).resolve()
             self.workspace.mkdir(parents=True, exist_ok=True)
             self.name = _safe_name(name or self.workspace.name)
-            self.parameters = _json_object(parameters, "parameters")
-            self.requirements = _json_object(requirements, "requirements")
+            self.parameters = parsed_parameters
+            self.requirements = parsed_requirements
             self.blocks = []
             self.snapshots = {}
             self.imports = []
@@ -734,7 +774,15 @@ class CadSessionRuntime:
             self._start()
             version = self._call("version", retry=False)
             self._call("reset", retry=False)
-            parameter_code = "PARAMS = " + repr(self.parameters)
+            # The server intentionally starts with an empty namespace.  Seed the
+            # supported modelling API once so the first feature can use Box,
+            # Cylinder, Pos, etc. without spending a fragile extra model turn on
+            # an import.  This block is replayed after supervised restarts too.
+            parameter_code = (
+                "from build123d import *\n"
+                f"{_MATH_SEED}\n"
+                "PARAMS = " + repr(self.parameters)
+            )
             parameter_result = self._call(
                 "execute", {"code": parameter_code}, retry=False
             )
@@ -753,10 +801,14 @@ class CadSessionRuntime:
             (self.workspace / f"{self.name}.session.json").write_text(
                 json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
             )
+            parameter_keys = ", ".join(sorted(self.parameters)) or "(none)"
+            requirement_keys = ", ".join(sorted(self.requirements)) or "(none)"
             return (
                 f"CAD session {self.session_id[:8]} started in {self.workspace}. "
                 f"build123d-mcp: {version.strip()}. Build incrementally with cad_execute; "
-                "call cad_measure after booleans and cad_validate before cad_export."
+                "call cad_measure after booleans and cad_validate before cad_export.\n"
+                f"Available PARAMS keys: {parameter_keys}.\n"
+                f"Acceptance requirement keys: {requirement_keys}."
             )
 
     def execute(self, code: str, checkpoint: str = "") -> str:
@@ -776,14 +828,23 @@ class CadSessionRuntime:
         except CadToolError as exc:
             self.execute_calls += 1
             return (f"CAD execution rejected: {exc}\n"
-                    "Use cad_last_error, repair only this feature, and retry once.")
+                    f"{self._parameter_hint()}\n"
+                    "Use cad_last_error, repair only this feature, and retry.")
         self.execute_calls += 1
         if _failed(output):
-            return output + "\nUse cad_last_error, repair only this feature, and retry once."
+            return (output + f"\n{self._parameter_hint()}\n"
+                    "Use cad_last_error, repair only this feature, and retry.")
         self.blocks.append(str(code))
         if checkpoint:
             output = output + "\n" + self.snapshot(checkpoint)
         return output
+
+    def _parameter_hint(self) -> str:
+        keys = sorted(self.parameters)
+        if not keys:
+            return ("PARAMS is empty. Restart with cad_begin and include the "
+                    "request's editable dimensions in parameters before building.")
+        return "Available PARAMS keys: " + ", ".join(keys) + "."
 
     def state(self) -> str:
         return self._call("session_state")
@@ -803,12 +864,29 @@ class CadSessionRuntime:
 
     def render(self, object_names: str = "", direction: str = "iso") -> str:
         self._require_active()
+        requested = str(object_names or "").strip()
+        if requested == "*":
+            names = self._registered_objects()
+            if not names:
+                raise CadMCPError("No named geometry is registered; nothing to render.")
+            requested = ",".join(names)
         preview = self.workspace / f"{self.name}.preview.png"
-        return self._call("render_view", {
-            "objects": object_names, "direction": direction,
+        result = self._call("render_view", {
+            "objects": requested, "direction": direction,
             "quality": "high", "save_to": str(preview), "format": "png",
             "label_objects": True,
         }, timeout=240)
+        # On Windows hosts without a complete VTK DLL stack, upstream performs a
+        # successful build123d hidden-line SVG fallback but includes the original
+        # ImportError in its message.  Returning that raw text makes the model
+        # misclassify a real preview as a failed operation.  Trust the bounded
+        # output file, not the diagnostic wording, and report the actual format.
+        vector_preview = preview.with_suffix(".svg")
+        if (not preview.is_file() or preview.stat().st_size == 0) \
+                and vector_preview.is_file() and vector_preview.stat().st_size > 0:
+            return ("CAD preview rendered successfully through the build123d "
+                    f"vector fallback: {vector_preview}")
+        return result
 
     def snapshot(self, name: str) -> str:
         label = _safe_name(name, "checkpoint")

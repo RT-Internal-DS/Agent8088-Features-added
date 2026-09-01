@@ -194,19 +194,31 @@ def test_cad_contract_reports_a_broken_runtime_instead_of_a_fallback(engine):
     assert "only modelling route" in ready
 
 
-def test_cad_generation_stops_after_two_backend_failures(engine, monkeypatch):
+def test_repairable_cad_failures_do_not_remove_execute_from_later_rounds(
+        engine, monkeypatch):
+    replies = iter([
+        '✿FUNCTION✿: cad_execute ✿ARGS✿: '
+        + json.dumps({"code": "bad_a = MissingPrimitive(1)"}),
+        '✿FUNCTION✿: cad_execute ✿ARGS✿: '
+        + json.dumps({"code": "bad_b = PARAMS['missing']"}),
+        '✿FUNCTION✿: cad_execute ✿ARGS✿: '
+        + json.dumps({"code": "part = Box(1,2,3)"}),
+        "done",
+    ])
+    visible_tools = []
+
     def completion(*args, **kwargs):
-        return _response(
-            '✿FUNCTION✿: cad_execute ✿ARGS✿: '
-            + json.dumps({"code": "part = Box(1,2,3)"})
-        )
+        visible_tools.append({item["function"]["name"] for item in args[1]})
+        return _response(next(replies))
 
     monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
     executions = []
 
     def execute(name, args, **kwargs):
         executions.append(name)
-        return "Error: CAD MCP operation failed"
+        if len(executions) <= 2:
+            return "Error: NameError: repair this feature\nUse cad_last_error"
+        return '{"passes_gate": true}'
 
     monkeypatch.setattr(engine, "exec_tool", execute)
     engine.run_agent(
@@ -215,9 +227,56 @@ def test_cad_generation_stops_after_two_backend_failures(engine, monkeypatch):
         tools_def=[{"type": "function", "function": {"name": "cad_execute"}}],
         allowed_tools={"cad_execute"},
     )
-    # Identical failed stateful calls are never executed twice without new
-    # evidence; the loop's duplicate-call breaker stops the second attempt.
-    assert executions == ["cad_execute"]
+    assert executions == ["cad_execute", "cad_execute", "cad_execute"]
+    assert all("cad_execute" in names for names in visible_tools[:3])
+
+
+def test_successful_cad_export_latches_completion_and_prevents_duplicate_rebuild(
+        engine, monkeypatch):
+    replies = iter([
+        '✿FUNCTION✿: cad_export ✿ARGS✿: '
+        + json.dumps({"filename": "part.step", "object_name": "Part"}),
+        '✿FUNCTION✿: open_cad_viewer ✿ARGS✿: '
+        + json.dumps({"filename": "wrong.step"}),
+        '✿FUNCTION✿: open_cad_viewer ✿ARGS✿: '
+        + json.dumps({"filename": "artifacts/part/part.step"}),
+        "The verified CAD artifacts are ready.",
+    ])
+    visible = []
+
+    def completion(*args, **kwargs):
+        visible.append({item["function"]["name"] for item in args[1]})
+        return _response(next(replies))
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
+    calls = []
+
+    def execute(name, args, **kwargs):
+        calls.append(name)
+        if name == "cad_export":
+            return "CAD export completed and independently reopened by text-to-cad."
+        if len([item for item in calls if item == "open_cad_viewer"]) == 1:
+            return "Error: Path not allowed"
+        return "Opened: http://127.0.0.1/viewer"
+
+    monkeypatch.setattr(engine, "exec_tool", execute)
+    cad_names = {
+        "cad_begin", "cad_execute", "cad_state", "cad_measure", "cad_inspect",
+        "cad_validate", "cad_render", "cad_snapshot", "cad_restore", "cad_compare",
+        "cad_import", "cad_last_error", "cad_export", "open_cad_viewer",
+    }
+    tools = [{"type": "function", "function": {"name": name}}
+             for name in sorted(cad_names)]
+    answer = engine.run_agent(
+        [{"role": "user", "content": "Design a CAD flange and open the viewer"}],
+        max_turns=4, system_prompt="base", tools_def=tools,
+        allowed_tools=cad_names,
+    )
+    assert answer == "The verified CAD artifacts are ready."
+    assert calls == ["cad_export", "open_cad_viewer", "open_cad_viewer"]
+    assert "cad_begin" not in visible[1] and "cad_execute" not in visible[1]
+    assert "cad_export" not in visible[1] and "open_cad_viewer" in visible[1]
+    assert "open_cad_viewer" not in visible[3]
 
 
 def test_convert_cad_is_excluded_from_the_auditor(engine):
@@ -398,6 +457,33 @@ def test_one_approval_covers_the_whole_cad_design_not_every_feature(
         result = engine.exec_tool("cad_execute", json.dumps(
             {"code": f"part{index} = Box(1,2,3)"}))
         assert "registered" in result, result
+
+
+def test_a_rejected_begin_retry_keeps_the_workspace_approval(
+        engine, monkeypatch, tmp_path):
+    engine.PERMISSION_MODE = "readonly"
+    engine.ARTIFACTS_ROOT = tmp_path
+    engine.ALLOWED_PATHS = [tmp_path]
+    attempts = 0
+
+    def begin(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ValueError("parameters must be a JSON object")
+        return "session started"
+
+    monkeypatch.setattr(engine.cad_mcp.RUNTIME, "begin", begin)
+    blocked = engine.exec_tool("cad_begin", json.dumps({"project": "part"}))
+    assert blocked.startswith("ESCALATION_REQUEST")
+    engine.grant_escalation("cad_session")
+    rejected = engine.exec_tool("cad_begin", json.dumps({"project": "part"}))
+    assert rejected.startswith("Error:")
+    retried = engine.exec_tool("cad_begin", json.dumps({
+        "project": "part", "parameters": {"plate_od": 120},
+    }))
+    assert "session started" in retried
+    assert attempts == 2
 
 
 def test_a_new_design_asks_again(engine, monkeypatch, tmp_path):
