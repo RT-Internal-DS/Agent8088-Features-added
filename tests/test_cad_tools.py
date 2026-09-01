@@ -107,6 +107,158 @@ def test_empty_cad_execute_is_a_recoverable_missing_argument(engine, monkeypatch
     assert called is False
 
 
+def test_active_cad_session_recovers_empty_execute_and_rejects_premature_summary(
+        engine, monkeypatch):
+    """Regression for a real run that stopped after cad_execute({})."""
+    replies = iter([
+        '✿FUNCTION✿: cad_begin ✿ARGS✿: '
+        + json.dumps({"project": "cad-recovery", "name": "RecoveredPart"}),
+        '✿FUNCTION✿: cad_execute ✿ARGS✿: {}',
+        "The CAD session is active, but no files exist. Say continue to resume.",
+        '✿FUNCTION✿: cad_execute ✿ARGS✿: '
+        + json.dumps({"code": "part = Box(20, 10, 5)\nshow(part, 'Part')"}),
+        '✿FUNCTION✿: cad_verify ✿ARGS✿: '
+        + json.dumps({"object_name": "Part"}),
+        '✿FUNCTION✿: cad_export ✿ARGS✿: '
+        + json.dumps({"filename": "part.step", "object_name": "Part"}),
+        "The verified CAD artifacts are ready.",
+    ])
+    model_inputs = []
+
+    def completion(messages, *args, **kwargs):
+        model_inputs.append([str(item.get("content") or "") for item in messages])
+        return _response(next(replies))
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
+    calls = []
+
+    def execute(name, raw_args, **kwargs):
+        args = json.loads(raw_args)
+        calls.append((name, args))
+        if name == "cad_begin":
+            return "CAD session deadbeef started in C:\\artifacts\\cad-recovery."
+        if name == "cad_execute" and not str(args.get("code") or "").strip():
+            return engine._tool_arg_missing_error(name, "code")
+        if name == "cad_execute":
+            return "CAD operation committed. Automatic checkpoint: 20 x 10 x 5 mm."
+        if name == "cad_verify":
+            return "CAD final verification: PASS"
+        if name == "cad_export":
+            return "CAD export completed and independently reopened by text-to-cad."
+        raise AssertionError(name)
+
+    monkeypatch.setattr(engine, "exec_tool", execute)
+    monkeypatch.setattr(engine.cad_mcp.RUNTIME, "blocks", [], raising=False)
+    names = {"cad_begin", "cad_execute", "cad_measure", "cad_validate",
+             "cad_verify", "cad_export"}
+    tools = [{"type": "function", "function": {"name": name}}
+             for name in sorted(names)]
+    trace = []
+    answer = engine.run_agent(
+        [{"role": "user", "content": "Generate a 20 mm CAD block and export STEP."}],
+        max_turns=10, system_prompt="base", tools_def=tools,
+        allowed_tools=names, trace=trace,
+    )
+
+    assert answer == "The verified CAD artifacts are ready."
+    assert [name for name, _ in calls] == [
+        "cad_begin", "cad_execute", "cad_execute", "cad_verify", "cad_export",
+    ]
+    assert calls[1][1] == {}
+    assert calls[2][1]["code"].startswith("part = Box")
+    combined_inputs = "\n".join("\n".join(items) for items in model_inputs)
+    assert "Do not summarize, stop, or ask the user to say continue" in combined_inputs
+    assert "CAD TASK INCOMPLETE" in combined_inputs
+    assert any(item.get("type") == "incomplete_cad_answer" for item in trace)
+
+
+def test_cad_plain_answer_remains_allowed_before_a_session_starts(engine, monkeypatch):
+    monkeypatch.setattr(
+        engine, "_create_completion_with_fallback",
+        lambda *args, **kwargs: _response("The CAD runtime is unavailable."),
+    )
+    names = {"cad_begin", "cad_execute", "cad_measure", "cad_validate", "cad_export"}
+    tools = [{"type": "function", "function": {"name": name}}
+             for name in sorted(names)]
+    answer = engine.run_agent(
+        [{"role": "user", "content": "Generate a CAD bracket."}],
+        max_turns=2, system_prompt="base", tools_def=tools, allowed_tools=names,
+    )
+    assert answer == "The CAD runtime is unavailable."
+
+
+def test_incomplete_cad_guard_does_not_override_a_permission_block(engine, monkeypatch):
+    replies = iter([
+        '✿FUNCTION✿: cad_begin ✿ARGS✿: '
+        + json.dumps({"project": "cad-denied", "name": "DeniedPart"}),
+        '✿FUNCTION✿: cad_export ✿ARGS✿: '
+        + json.dumps({"filename": "part.step", "object_name": "Part"}),
+        "I could not export the CAD file because write permission was unavailable.",
+    ])
+    monkeypatch.setattr(
+        engine, "_create_completion_with_fallback",
+        lambda *args, **kwargs: _response(next(replies)),
+    )
+
+    def execute(name, raw_args, **kwargs):
+        if name == "cad_begin":
+            return "CAD session deadbeef started in C:\\artifacts\\cad-denied."
+        return "ESCALATION_REQUEST\x1fedit\x1fcad_session\x1fC:\\artifacts\\cad-denied"
+
+    monkeypatch.setattr(engine, "exec_tool", execute)
+    names = {"cad_begin", "cad_execute", "cad_measure", "cad_validate", "cad_export"}
+    tools = [{"type": "function", "function": {"name": name}}
+             for name in sorted(names)]
+    answer = engine.run_agent(
+        [{"role": "user", "content": "Generate and export a CAD bracket."}],
+        max_turns=4, system_prompt="base", tools_def=tools, allowed_tools=names,
+    )
+    assert "write permission was unavailable" in answer
+
+
+def test_cad_continuation_inherits_the_live_supervised_session(engine, monkeypatch, tmp_path):
+    replies = iter([
+        "The previous CAD attempt is still incomplete. Say continue again.",
+        '✿FUNCTION✿: cad_execute ✿ARGS✿: '
+        + json.dumps({"code": "part = Box(20, 10, 5)\nshow(part, 'Part')"}),
+        '✿FUNCTION✿: cad_export ✿ARGS✿: '
+        + json.dumps({"filename": "part.step", "object_name": "Part"}),
+        "The verified resumed CAD artifact is ready.",
+    ])
+    monkeypatch.setattr(
+        engine, "_create_completion_with_fallback",
+        lambda *args, **kwargs: _response(next(replies)),
+    )
+    monkeypatch.setattr(engine.cad_mcp.RUNTIME, "session_id", "deadbeef")
+    monkeypatch.setattr(engine.cad_mcp.RUNTIME, "workspace", tmp_path)
+    monkeypatch.setattr(engine.cad_mcp.RUNTIME, "blocks", [])
+    calls = []
+
+    def execute(name, raw_args, **kwargs):
+        calls.append(name)
+        if name == "cad_execute":
+            return "CAD operation committed. Automatic checkpoint: 20 x 10 x 5 mm."
+        if name == "cad_export":
+            return "CAD export completed and independently reopened by text-to-cad."
+        raise AssertionError(name)
+
+    monkeypatch.setattr(engine, "exec_tool", execute)
+    names = {"cad_begin", "cad_execute", "cad_measure", "cad_validate", "cad_export"}
+    tools = [{"type": "function", "function": {"name": name}}
+             for name in sorted(names)]
+    messages = [
+        {"role": "user", "content": "Generate a 20 mm CAD block and export STEP."},
+        {"role": "assistant", "content": "The session started but did not finish."},
+        {"role": "user", "content": "continue"},
+    ]
+    answer = engine.run_agent(
+        messages, max_turns=6, system_prompt="base",
+        tools_def=tools, allowed_tools=names,
+    )
+    assert answer == "The verified resumed CAD artifact is ready."
+    assert calls == ["cad_execute", "cad_export"]
+
+
 def test_cad_generation_request_disables_generic_execution_and_injects_real_artifacts_path(
         engine, monkeypatch):
     seen = {}

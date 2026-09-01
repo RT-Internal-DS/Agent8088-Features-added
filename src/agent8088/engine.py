@@ -7484,6 +7484,7 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
 CLI_ANYTHING_MIN_TURNS = 20
 CLI_ANYTHING_MAX_TURNS = 60
 CAD_PROJECT_MIN_TURNS = 48  # retained name for compatibility; now MCP session turns
+CAD_INCOMPLETE_ANSWER_RETRY_LIMIT = 3
 CLI_ANYTHING_EXTENSION_TURNS = 5
 
 
@@ -7694,6 +7695,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     forced_stop = False
     cad_failures = 0
     cad_transport_stopped = False
+    cad_terminal_blocked = False
+    cad_session_started = False
+    cad_incomplete_answer_retries = 0
     cad_export_completed = False
     cad_viewer_opened = False
 
@@ -7711,6 +7715,15 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     dynamic_cli = _cli_anything_requested(messages)
     no_execute_shell = _execute_shell_forbidden(messages)
     cad_generation = _cad_generation_requested(messages)
+    if cad_generation:
+        # A new user turn (for example, "continue") creates a fresh agent loop,
+        # but the supervised MCP runtime remains alive in the CLI process. Carry
+        # that lifecycle state into the new loop so a model cannot bypass the
+        # verified-export completion guard merely by stopping once and resuming.
+        cad_session_started = bool(
+            getattr(cad_mcp.RUNTIME, "session_id", "")
+            and getattr(cad_mcp.RUNTIME, "workspace", None)
+        )
     hard_turn_limit = max(turn_limit, CLI_ANYTHING_MAX_TURNS) if dynamic_cli else turn_limit
     for turn in range(hard_turn_limit):
         if turn >= turn_limit:
@@ -7963,6 +7976,47 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                           f"Available tools: {', '.join(sorted(round_allowed_tools)) or 'none'}."
                           if unknown else "I wasn't able to produce an answer to that.")
 
+            # Once a supervised CAD session has started, a prose status update is
+            # not task completion. Models occasionally emit an empty cad_execute,
+            # receive the recoverable argument error, and then ask the user to say
+            # "continue" instead of repairing the call. Keep the bounded loop alive
+            # until the verified export commit point, unless the transport is
+            # unavailable or the user explicitly denied the required permission.
+            if (cad_generation and cad_session_started
+                    and not cad_export_completed
+                    and not cad_transport_stopped
+                    and not cad_terminal_blocked):
+                if cad_incomplete_answer_retries < CAD_INCOMPLETE_ANSWER_RETRY_LIMIT:
+                    cad_incomplete_answer_retries += 1
+                    has_geometry = bool(getattr(cad_mcp.RUNTIME, "blocks", []))
+                    next_action = (
+                        "Call cad_state now, then continue with exactly one needed "
+                        "feature operation per cad_execute response."
+                        if has_geometry else
+                        "Call cad_execute now with a non-empty JSON code argument that "
+                        "creates the first small, coherent build123d feature."
+                    )
+                    recovery = (
+                        "CAD TASK INCOMPLETE: a supervised CAD session is active, but "
+                        "cad_export has not completed. Do not give a status summary, ask "
+                        "the user to say continue, or claim completion. " + next_action
+                        + " Keep using the supervised CAD tools until cad_verify and "
+                        "cad_export succeed."
+                    )
+                    messages.append({"role": "user", "content": recovery})
+                    if on_result:
+                        on_result("error", recovery)
+                    if trace is not None:
+                        trace.append({"turn": turn,
+                                      "type": "incomplete_cad_answer",
+                                      "retry": cad_incomplete_answer_retries})
+                    continue
+                answer = (
+                    "Error: the model repeatedly stopped while a supervised CAD session "
+                    "was still incomplete. No verified export was produced. The session "
+                    "has been preserved for a later retry."
+                )
+
             answer = _guard_answer(answer)
             if on_answer:
                 on_answer(answer)
@@ -8049,15 +8103,28 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # a sub-run the text travels on as evidence the step failed.
             if _is_missing_argument_error(result) and missing_args_retries < 2:
                 missing_args_retries += 1
-                messages.append({"role": "user", "content": result})
+                recovery = result
+                if cad_generation and name == "cad_execute":
+                    recovery += (
+                        "\nThe supervised CAD session is still active. Do not summarize, "
+                        "stop, or ask the user to say continue. Retry now with exactly one "
+                        "cad_execute call whose JSON contains a non-empty code string for "
+                        "the next small build123d feature."
+                    )
+                messages.append({"role": "user", "content": recovery})
                 if trace is not None:
                     trace.append({"turn": turn, "type": "missing_tool_args",
                                   "tool": name})
                 continue
             executed = True
             tool_outputs.append(result)
+            plain_result = _unwrap_untrusted(result)
+            if (name == "cad_begin" and "CAD session " in plain_result
+                    and " started in " in plain_result):
+                cad_session_started = True
+                cad_incomplete_answer_retries = 0
             if name == "cad_execute":
-                plain_cad_result = _unwrap_untrusted(result)
+                plain_cad_result = plain_result
                 if (result.startswith(("CAD generation failed", "CAD design generation failed", "Error:"))
                         or "Use cad_last_error" in plain_cad_result):
                     cad_failures += 1
@@ -8088,7 +8155,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                         )
                 else:
                     cad_failures = 0
-            plain_result = _unwrap_untrusted(result)
+                    cad_incomplete_answer_retries = 0
             if name == "cad_export" and "CAD export completed" in plain_result:
                 cad_export_completed = True
             elif name == "open_cad_viewer" and plain_result.lstrip().startswith("Opened:"):
@@ -8126,6 +8193,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                         trace.append({"turn": turn, "type": "denial_breaker",
                                       "content": answer})
                     return answer
+                if name.startswith("cad_") or name == "open_cad_viewer":
+                    cad_terminal_blocked = True
                 messages.append({"role": "user", "content":
                     "Permission denied by the user. You remain in readonly mode. "
                     "Tell the user what you could not do and why the task cannot be completed."})
@@ -8156,6 +8225,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 result = (f"Permission denied: {name} needs access this run does not "
                           f"have, and there is nobody to ask. Do not retry it. "
                           f"Continue without it, or explain what you could not do.")
+                if name.startswith("cad_") or name == "open_cad_viewer":
+                    cad_terminal_blocked = True
             model_result = _tool_result_for_model(name, result)
             messages.append({"role": "user", "content":
                              f"{_TOOL_RESULT_PREFIX}{name}):\n{model_result}{note}"})
