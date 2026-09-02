@@ -44,6 +44,26 @@ def test_plan_parser_and_validation_require_a_real_unchecked_plan():
     assert "start unchecked" in validate_plan(PLAN.replace("[ ] Main", "[x] Main"))
 
 
+def test_plan_parser_accepts_natural_build_headings_and_list_markers():
+    variant = PLAN.replace("## Components", "## Build Checklist").replace(
+        "- [ ] Main tube", "1. [ ] Hilbert curve bars").replace(
+        "- [ ] Final telescope assembly", "* [ ] Outer cube assembly")
+    assert parse_components(variant) == [
+        ("Hilbert curve bars", False), ("Outer cube assembly", False)
+    ]
+    assert validate_plan(variant) is None
+
+
+def test_validation_checkboxes_are_not_treated_as_components():
+    plan = PLAN.replace(
+        "- Validate every solid\n- Review snapshot\n- Open in CAD Viewer",
+        "- [ ] Validate every solid\n- [ ] Review snapshot\n- [ ] Open in CAD Viewer",
+    )
+    assert parse_components(plan) == [
+        ("Main tube", False), ("Final telescope assembly", False)
+    ]
+
+
 def test_first_phase_exposes_only_write_file_and_caps_completion(tmp_path):
     job = CadWorkflow(tmp_path)
     assert job.allowed_tools({"write_file", "execute_shell", "read_text"}) == {"write_file"}

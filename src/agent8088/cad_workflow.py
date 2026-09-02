@@ -25,7 +25,8 @@ class CadPhase(str, Enum):
     COMPLETE = "complete"
 
 
-_CHECKBOX_RE = re.compile(r"^\s*-\s*\[([ xX])\]\s+(.+?)\s*$", re.MULTILINE)
+_CHECKBOX_RE = re.compile(
+    r"^\s*(?:[-*+]|\d+[.)])\s*\[([ xX])\]\s+(.+?)\s*$", re.MULTILINE)
 _PLAN_PATH_RE = re.compile(r"([^\s\"']+\.plan\.md)\b", re.IGNORECASE)
 _PRIMARY_OUTPUT_RE = re.compile(
     r"(?im)^\s*-?\s*Primary\s+output\s*:\s*`?([^`\s]+\.(?:step|stp))`?\s*$"
@@ -33,13 +34,30 @@ _PRIMARY_OUTPUT_RE = re.compile(
 
 
 def parse_components(content: str) -> list[tuple[str, bool]]:
-    """Return plan checklist labels and their checked state in source order."""
-    section = re.search(
-        r"(?ims)^##\s+Components?\s*$\n(.*?)(?=^##\s+|\Z)", content or "")
-    if not section:
-        return []
-    return [(label.strip(), mark.lower() == "x")
-            for mark, label in _CHECKBOX_RE.findall(section.group(1))]
+    """Return build-item checkboxes while ignoring verification checklists.
+
+    Models naturally use headings such as ``Build checklist``, ``Parts``, or
+    ``Geometry`` even when asked for ``Components``. Requiring one exact heading
+    made otherwise valid plans impossible to start. Keep validation/snapshot
+    checkboxes out of the component state machine, but accept ordinary Markdown
+    heading and list variants for the build section.
+    """
+    items: list[tuple[str, bool]] = []
+    heading = ""
+    excluded = re.compile(
+        r"\b(?:validat\w*|verif\w*|required\s+checks?|snapshot\w*|"
+        r"visual\s+review|viewer\w*|handoff\w*|tests?)\b",
+        re.IGNORECASE,
+    )
+    for line in (content or "").splitlines():
+        header = re.match(r"^#{2,6}\s+(.+?)\s*$", line)
+        if header:
+            heading = header.group(1)
+            continue
+        match = _CHECKBOX_RE.match(line)
+        if match and not excluded.search(heading):
+            items.append((match.group(2).strip(), match.group(1).lower() == "x"))
+    return items
 
 
 def validate_plan(content: str) -> str | None:
@@ -53,7 +71,8 @@ def validate_plan(content: str) -> str | None:
     if ".step" not in lowered and ".stp" not in lowered:
         return "the plan must name the primary STEP output"
     if not components:
-        return "the plan needs at least one unchecked component checklist item"
+        return ("the plan needs at least one build checklist item formatted like "
+                "`## Components` followed by `- [ ] Main solid`")
     if any(checked for _label, checked in components):
         return "new plan component items must start unchecked"
     if "validation" not in lowered and "required checks" not in lowered:
@@ -183,9 +202,11 @@ class CadWorkflow:
 CURRENT PHASE: PLAN_REQUIRED.
 Your first and only action is one write_file call creating {plan} under the artifacts workspace.
 Do not print a plan in chat. Do not write geometry source yet. Do not call any other tool.
-The Markdown must contain: a title; units; primary .step output; assumptions; an unchecked
-component checklist in build order (the final assembly/output is the last item when applicable);
-and required validation, snapshot-review, and Viewer-handoff checks.
+The Markdown must contain: a title; units; primary .step output; assumptions; and required
+validation, snapshot-review, and Viewer-handoff checks. The build list MUST use this literal shape:
+## Components
+- [ ] Main solid
+Add further unchecked items in build order; the final assembly/output is last when applicable.
 """
         phase_text = {
             CadPhase.BUILD: "Read the plan as needed. Build only the next unchecked item, then run scripts/gen on its explicit .step.py target.",
