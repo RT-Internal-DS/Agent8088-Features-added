@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import cad, cli_anything, documents, memory, web_search
+from agent8088 import cad, cad_workflow, cli_anything, documents, memory, web_search
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -2423,8 +2423,14 @@ def load_skill_packages(skills_dir: Path, config: dict) -> dict:
             "description": meta.get("description", default_tool_description(name)),
             "version": meta.get("version", "0"),
             "category": meta.get("category", "general"),
-            "progressive": str(meta.get("progressive", "false")).strip().lower()
-                           in {"1", "true", "yes", "on"},
+            # Keep the vendored upstream CAD tree byte-for-byte intact while
+            # loading its large playbook only on CAD turns. The workflow
+            # controller injects it after the small plan-first phase.
+            "progressive": (
+                str(meta.get("progressive", "false")).strip().lower()
+                in {"1", "true", "yes", "on"}
+                or name == "cad"
+            ),
             "path": str(pkg),
             "prose": body.strip(),
             "tools": tools,
@@ -7465,6 +7471,9 @@ CLI_ANYTHING_MAX_TURNS = 60
 # tuned (or lowered) from config.txt/GUI without a code change; /maxturns still
 # raises it further for the whole session if set higher.
 CAD_GENERATION_MIN_TURNS = int(APP_CONFIG.get("cad_generation_min_turns", "40"))
+CAD_PLAN_MAX_COMPLETION_TOKENS = int(
+    APP_CONFIG.get("cad_plan_max_completion_tokens", "1500")
+)
 CLI_ANYTHING_EXTENSION_TURNS = 5
 
 
@@ -7581,6 +7590,33 @@ def _cad_runtime_instruction(available: set[str] | None = None) -> str:
     return "\n".join(lines)
 
 
+def _cad_plan_system_prompt(prompt: str) -> str:
+    """Shrink the first CAD round to its one permitted action.
+
+    Ollama-compatible providers learn tools from the textual system prompt, not
+    only the API tool schema. Filtering ``tools_def`` therefore is not enough:
+    leaving every tool and installed playbook in the prompt still asks a
+    reasoning model to consider all of them before writing the plan.
+    """
+    tool_start = prompt.find("\n## Tools")
+    skill_start = prompt.find("\n## Installed skills", tool_start + 1)
+    if tool_start < 0 or skill_start < 0:
+        return prompt
+    suffixes = [
+        index for marker in ("\n## About the user", RUNTIME_CONTEXT_HEADING)
+        if (index := prompt.find(marker, skill_start + 1)) >= 0
+    ]
+    skill_end = min(suffixes) if suffixes else len(prompt)
+    write_spec = {"write_file": TOOL_SPECS["write_file"]} if "write_file" in TOOL_SPECS else {}
+    compact_skill = (
+        "\n## Installed skills\n\n### cad\n"
+        "STEP-first CAD is active. The workflow controller will load the "
+        "upstream text-to-cad playbook after the Markdown plan is accepted.\n"
+    )
+    return (prompt[:tool_start] + render_tool_docs(write_spec)
+            + compact_skill + prompt[skill_end:])
+
+
 def _tool_definition_name(definition: dict) -> str:
     function = definition.get("function") if isinstance(definition, dict) else None
     if isinstance(function, dict):
@@ -7643,10 +7679,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     search_results = {}  # query signature -> that search's output, for reuse
     forced_stop = False
     cad_failures = 0
-    # Plan-then-emit gate: after the model has produced text (its BUILD PLAN)
-    # on a CAD turn, the next turn gets one nudge to convert the plan into the
-    # single generation call. Never blocks a turn that already calls a tool.
-    cad_plan_pending = False
+    cad_no_action_retries = 0
     cad_decomposition_required = False
 
     # Fast path: a request for internal instructions/config is a policy refusal —
@@ -7663,6 +7696,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     dynamic_cli = _cli_anything_requested(messages)
     no_execute_shell = _execute_shell_forbidden(messages)
     cad_generation = _cad_generation_requested(messages)
+    cad_job = (
+        cad_workflow.CadWorkflow.for_messages(ARTIFACTS_ROOT, messages)
+        if cad_generation else None
+    )
     hard_turn_limit = max(turn_limit, CLI_ANYTHING_MAX_TURNS) if dynamic_cli else turn_limit
     for turn in range(hard_turn_limit):
         if turn >= turn_limit:
@@ -7682,12 +7719,28 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # _is_cad_scoped_command); anything else still goes through normal
             # permission gating like any other shell/write call.
             round_allowed_tools.discard("run_sandboxed")
+            round_allowed_tools = cad_job.allowed_tools(round_allowed_tools)
         round_tools_def = _filter_tool_definitions(round_tools_def, round_allowed_tools)
         round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
         if cad_generation:
+            prompt_base = round_system_prompt or current_system_prompt()
+            if cad_job.phase == cad_workflow.CadPhase.PLAN_REQUIRED:
+                prompt_base = _cad_plan_system_prompt(prompt_base)
+            skill_text = ""
+            if cad_job.phase != cad_workflow.CadPhase.PLAN_REQUIRED:
+                try:
+                    skill_text = read_skill_resource("cad", "SKILL.md")
+                except (OSError, UnicodeError, ValueError):
+                    pass
+            runtime_contract = (
+                "" if cad_job.phase == cad_workflow.CadPhase.PLAN_REQUIRED
+                else "\n\n" + _cad_runtime_instruction(round_allowed_tools)
+            )
             round_system_prompt = (
-                (round_system_prompt or current_system_prompt())
-                + "\n\n" + _cad_runtime_instruction(round_allowed_tools)
+                prompt_base
+                + runtime_contract
+                + "\n\n" + cad_job.instruction(
+                    include_skill=bool(skill_text), skill_text=skill_text)
             )
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
@@ -7715,6 +7768,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             min(turn_completion_limit * 2, turn_context_window)
             if length_retries and not cad_generation else turn_completion_limit
         )
+        if cad_job is not None:
+            turn_max_tokens = cad_job.max_completion_tokens(
+                turn_max_tokens, CAD_PLAN_MAX_COMPLETION_TOKENS)
         try:
             with spin("thinking..."):
                 response = _create_completion_with_fallback(
@@ -7845,22 +7901,23 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
 
             answer = strip_tool_json(content)
 
-            # Plan-then-emit gate: on a CAD turn the model was asked for a BUILD
-            # PLAN first. When its text-only reply IS that plan, nudge once to
-            # emit the single generation call instead of returning the plan to
-            # the user. Bounded: one injection, then the answer flows normally.
-            if (cad_generation and not cad_plan_pending and not cad_decomposition_required
-                    and answer and len(answer.splitlines()) >= 3
-                    and "write_file" in round_allowed_tools):
-                cad_plan_pending = True
-                messages.append({"role": "user", "content":
-                    "Plan received — now write the gen_step() source implementing it "
-                    "with write_file, then run it via the CAD skill's scripts/gen. "
-                    "No more prose: proceed directly, complete code, no narration."
-                })
-                if trace is not None:
-                    trace.append({"turn": turn, "type": "cad_plan_ack"})
-                continue
+            if (cad_job is not None
+                    and cad_job.phase != cad_workflow.CadPhase.COMPLETE):
+                cad_no_action_retries += 1
+                if cad_no_action_retries <= 2:
+                    messages.append({"role": "user", "content":
+                        "The CAD workflow is not complete, so a prose answer cannot "
+                        "end this request. Perform the current phase now with one "
+                        "allowed tool call.\n\n" + cad_job.instruction()})
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "cad_phase_nudge",
+                                      "phase": cad_job.phase.value})
+                    continue
+                answer = (
+                    f"CAD workflow stopped in phase '{cad_job.phase.value}' after "
+                    "two responses without the required action. Preserved artifacts "
+                    "and workflow state can be resumed; no later phase was claimed."
+                )
 
             # Reasoning-only / empty turn: nudge once for a plain answer rather than
             if not answer and empty_retries < 1 and not forcing and not unknown:
@@ -7949,6 +8006,17 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # the interrupt is only noticed at the top of the next turn — after
             # the write has already landed.
             _raise_if_interrupted(interrupt_check)
+            workflow_block = cad_job.validate_call(name, args) if cad_job else None
+            if workflow_block:
+                tool_outputs.append(workflow_block)
+                if on_result:
+                    on_result(name, workflow_block)
+                messages.append({"role": "user", "content":
+                                 f"{_TOOL_RESULT_PREFIX}{name}):\n{workflow_block}"})
+                if turn_tools is not None:
+                    turn_tools.append({"name": name, "arguments": args,
+                                       "result": workflow_block, "blocked": True})
+                continue
             if on_tool:
                 on_tool(name)
             # on_calls already announced "Searching the web..." once; this spinner
@@ -8015,7 +8083,11 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                         )
                 else:
                     cad_failures = 0
-                    cad_plan_pending = False
+            if cad_job is not None:
+                phase_before = cad_job.phase
+                cad_job.observe(name, args, result)
+                if cad_job.phase != phase_before:
+                    cad_no_action_retries = 0
             if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
                 # Remember what this query returned so a reworded repeat can be
                 # answered from it. An escalation is not a result — recording it

@@ -79,6 +79,14 @@ timeout_seconds=120
 # context_window=32768
 # max_completion_tokens=8192
 
+# CAD workflow orchestration. The first CAD response is deliberately small and
+# may only create the persistent Markdown plan; normal provider limits apply
+# after that phase.
+# cad_plan_max_completion_tokens=1500
+# cad_generation_min_turns=40
+# cad_max_generation_attempts=4
+# cad_scoped_shell_timeout_seconds=900
+
 # --- display ---
 # Pygments theme for the code the agent reads and writes: file listings, diffs
 # and fenced code blocks in its answers. Any Pygments style name works —
