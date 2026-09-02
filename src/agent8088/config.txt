@@ -79,10 +79,24 @@ timeout_seconds=120
 # context_window=32768
 # max_completion_tokens=8192
 
-# CAD workflow orchestration. The first CAD response is deliberately small and
-# may only create the persistent Markdown plan; normal provider limits apply
-# after that phase.
-# cad_plan_max_completion_tokens=1500
+# CAD workflow orchestration. Each phase of the CAD controller gets its own
+# completion budget so one round cannot spend a whole 65k provider ceiling on a
+# single runaway generator.
+#
+# Raising a provider's max_completion_tokens does NOT require lowering these,
+# and lowering them below the model's reasoning floor breaks the workflow
+# outright: a reasoning model streams its chain-of-thought into the completion
+# budget before the first tool-call token, so a cap under that floor truncates
+# every round before any tool call is emitted and no phase can ever pass.
+# Measured against glm-5.1 on ollama-cloud: ~1.2-1.5k completion tokens for a
+# trivial write_file, and >10k tokens of pure reasoning before a non-trivial
+# generator emits its first character. Treat ~8k as the practical minimum for
+# any phase and leave the source phase generous.
+# cad_plan_max_completion_tokens=8192
+# cad_source_max_completion_tokens=32768
+# cad_action_max_completion_tokens=8192
+# cad_final_max_completion_tokens=8192
+# cad_reasoning_effort=low
 # cad_generation_min_turns=40
 # cad_max_generation_attempts=4
 # cad_scoped_shell_timeout_seconds=900

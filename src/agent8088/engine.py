@@ -1716,6 +1716,7 @@ def _finish_interrupt_watcher(stop, watcher):
 def create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                       temperature=0.1, on_token=None, interrupt_check=None,
                       model_name: str = "", provider_name: str = "",
+                      reasoning_effort: str = "",
                       telemetry_attempt: str = "direct"):
     """Create one model response and record metadata-only local telemetry."""
     started = time.monotonic()
@@ -1726,6 +1727,7 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
             client, messages, tools, max_tokens=max_tokens, system_prompt=system_prompt,
             temperature=temperature, on_token=on_token, interrupt_check=interrupt_check,
             model_name=selected_model, provider_name=provider,
+            reasoning_effort=reasoning_effort,
         )
     except Exception as exc:
         _record_model_telemetry(provider, selected_model, telemetry_attempt, started,
@@ -1752,7 +1754,8 @@ def _is_unknown_param_error(exc: Exception) -> bool:
 
 def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                        temperature=0.1, on_token=None, interrupt_check=None,
-                       model_name: str = "", provider_name: str = ""):
+                       model_name: str = "", provider_name: str = "",
+                       reasoning_effort: str = ""):
     selected_model = model_name or MODEL_NAME
     full_messages = [{"role": "system", "content": system_prompt or current_system_prompt()}, *messages]
     penalties = {}
@@ -1775,6 +1778,8 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             kwargs["api_base"] = client["api_base"]
         if client.get("api_key"):
             kwargs["api_key"] = client["api_key"]
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
         _raise_if_interrupted(interrupt_check)
         response = completion(**kwargs)
         if on_token is None:
@@ -1811,8 +1816,8 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
     # Optional per-provider reasoning dial (provider.<name>.reasoning_effort).
     # Some OpenAI-compatible layers accept reasoning_effort, others 400 on the
     # unknown field — retry clean once on that specific rejection.
-    effort = ""
-    if provider_name:
+    effort = reasoning_effort.strip()
+    if not effort and provider_name:
         effort = str((PROVIDERS.get(provider_name) or {}).get("reasoning_effort") or "").strip()
     if effort:
         request_options["extra_body"] = {"reasoning_effort": effort}
@@ -1833,7 +1838,8 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
                 client, messages, tools, max_tokens=max_tokens,
                 system_prompt=system_prompt, temperature=temperature,
                 on_token=on_token, interrupt_check=interrupt_check,
-                model_name=model_name, provider_name=provider_name)
+                model_name=model_name, provider_name=provider_name,
+                reasoning_effort=reasoning_effort)
         raise
     collected, tool_chunks, finish_reason = [], {}, None
     stop, watcher = _start_interrupt_watcher(stream, interrupt_check)
@@ -1914,7 +1920,8 @@ def _retry_delay(retry_attempt, retry_after_ms=None):
 def _create_completion_with_fallback(messages, tools, *, temperature, system_prompt,
                                      on_token, interrupt_check, trace, turn,
                                      max_tokens=None, client_override=None,
-                                     provider_override=None, model_override=None):
+                                     provider_override=None, model_override=None,
+                                     reasoning_effort=""):
     active_client = client_override if client_override is not None else client
     active_provider = provider_override or ACTIVE_PROVIDER or DEFAULT_PROVIDER
     active_model = model_override or MODEL_NAME
@@ -1938,6 +1945,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 interrupt_check=interrupt_check,
                 model_name=active_model,
                 provider_name=active_provider,
+                reasoning_effort=reasoning_effort,
                 telemetry_attempt="primary",
             )
         except AgentInterrupted:
@@ -1969,7 +1977,8 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 max_tokens=max_tokens,
                 system_prompt=system_prompt, on_token=token_handler,
                 interrupt_check=interrupt_check, model_name=model_name,
-                provider_name=provider_name, telemetry_attempt="fallback",
+                provider_name=provider_name, reasoning_effort=reasoning_effort,
+                telemetry_attempt="fallback",
             )
         except AgentInterrupted:
             raise
@@ -7471,9 +7480,28 @@ CLI_ANYTHING_MAX_TURNS = 60
 # tuned (or lowered) from config.txt/GUI without a code change; /maxturns still
 # raises it further for the whole session if set higher.
 CAD_GENERATION_MIN_TURNS = int(APP_CONFIG.get("cad_generation_min_turns", "40"))
+# Per-phase completion budgets for the CAD controller.
+#
+# These bound a phase; they must never shrink it below what the model needs to
+# answer at all. Reasoning models stream chain-of-thought into the *completion*
+# budget before the first tool-call token appears, so a cap under that floor
+# truncates every round before any tool call and the phase can never pass.
+# Measured against glm-5.1/ollama-cloud: ~1.2-1.5k completion tokens for a
+# trivial write_file, and >10k tokens of pure reasoning before a non-trivial
+# generator emits its first character. Keep these well clear of that floor.
 CAD_PLAN_MAX_COMPLETION_TOKENS = int(
-    APP_CONFIG.get("cad_plan_max_completion_tokens", "1500")
+    APP_CONFIG.get("cad_plan_max_completion_tokens", "8192")
 )
+CAD_SOURCE_MAX_COMPLETION_TOKENS = int(
+    APP_CONFIG.get("cad_source_max_completion_tokens", "32768")
+)
+CAD_ACTION_MAX_COMPLETION_TOKENS = int(
+    APP_CONFIG.get("cad_action_max_completion_tokens", "8192")
+)
+CAD_FINAL_MAX_COMPLETION_TOKENS = int(
+    APP_CONFIG.get("cad_final_max_completion_tokens", "8192")
+)
+CAD_REASONING_EFFORT = str(APP_CONFIG.get("cad_reasoning_effort", "low")).strip()
 CLI_ANYTHING_EXTENSION_TURNS = 5
 
 
@@ -7590,6 +7618,58 @@ def _cad_runtime_instruction(available: set[str] | None = None) -> str:
     return "\n".join(lines)
 
 
+def _cad_autorun_phases(cad_job, messages, *, trace, turn, on_tool, on_result,
+                        depth=0, max_steps: int = 8) -> None:
+    """Execute every consecutive CAD phase that needs no model judgement.
+
+    The controller already knows the exact call for the command-only phases, so
+    asking the model to reproduce it costs a full reasoning cycle and adds
+    nothing. Run them here and stop as soon as a phase needs the model (author
+    source, repair a failure, write the final report) or a step fails to
+    advance the phase.
+
+    The results are appended to ``messages`` in the same assistant/user shape a
+    model-issued tool call would produce, so the transcript the model sees next
+    round is unchanged in kind -- it simply already contains the deterministic
+    work.
+    """
+    cad_python = str(cad.cad_runtime_python())
+    scripts_dir = str(_cad_skill_scripts_dir()).replace("\\", "/")
+    for _step in range(max_steps):
+        planned = cad_job.autorun(cad_python=cad_python, scripts_dir=scripts_dir)
+        if not planned:
+            return
+        name, args = planned
+        phase_before = cad_job.phase
+        if on_tool:
+            on_tool(name, args)
+        try:
+            result = run_tool(name, args, depth=depth)
+        except AgentInterrupted:
+            raise
+        except Exception as exc:                      # noqa: BLE001 - reported
+            result = f"Error: {exc}"
+        if on_result:
+            on_result(name, result)
+        # Keep the transcript coherent: the model must see the call and its
+        # outcome, otherwise the next round re-proposes work already done.
+        messages.append({"role": "assistant", "content": _native_tool_text(
+            type("M", (), {"tool_calls": [type("T", (), {"function": type("F", (), {
+                "name": name, "arguments": json.dumps(args)})()})()]})())})
+        messages.append({"role": "user", "content":
+                         _tool_result_for_model(name, result)})
+        cad_job.observe(name, args, result)
+        if trace is not None:
+            trace.append({"turn": turn, "type": "cad_autorun", "tool": name,
+                          "phase_before": phase_before.value,
+                          "phase_after": cad_job.phase.value})
+        if cad_job.phase == phase_before:
+            # The step did not move the workflow on (a failure, or an edit the
+            # controller could not make safely). Hand back to the model rather
+            # than retrying the same deterministic call.
+            return
+
+
 def _cad_plan_system_prompt(prompt: str) -> str:
     """Shrink the first CAD round to its one permitted action.
 
@@ -7674,6 +7754,11 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     parse_error_retries = 0   # times a call's arguments were unparseable JSON
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
     length_retries = 0   # token-limited calls are incomplete and must never execute
+    # A CAD request legitimately runs for CAD_GENERATION_MIN_TURNS bounded
+    # rounds. Spending the single global retry on one truncated round would end
+    # the whole lifecycle, so allow a cutoff to be retried a few times across
+    # the run -- each retry still re-prompts for a smaller, complete call.
+    length_retry_budget = 1
     plan_mutation_retries = 0
     searched = False     # prevents speculative page browsing after search results
     search_results = {}  # query signature -> that search's output, for reuse
@@ -7696,6 +7781,15 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     dynamic_cli = _cli_anything_requested(messages)
     no_execute_shell = _execute_shell_forbidden(messages)
     cad_generation = _cad_generation_requested(messages)
+    if cad_generation:
+        length_retry_budget = 4
+        # Upstream ships a warm-process daemon precisely because every
+        # scripts/gen | export | inspect | snapshot call otherwise pays a
+        # multi-second OCP/build123d import, and this workflow makes several
+        # per component. The CLIs fall back to a cold in-process run on any
+        # daemon or protocol problem, so enabling it cannot break a build.
+        # Inherited by the shell layer, which passes no explicit env.
+        os.environ.setdefault("CADGEN_WARM", "1")
     cad_job = (
         cad_workflow.CadWorkflow.for_messages(ARTIFACTS_ROOT, messages)
         if cad_generation else None
@@ -7704,6 +7798,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     for turn in range(hard_turn_limit):
         if turn >= turn_limit:
             break
+        if cad_job is not None:
+            _cad_autorun_phases(
+                cad_job, messages, trace=trace, turn=turn,
+                on_tool=on_tool, on_result=on_result, depth=depth)
         round_tools_def = tools_def() if callable(tools_def) else tools_def
         round_allowed_tools = set(
             allowed_tools() if callable(allowed_tools) else allowed_tools
@@ -7726,10 +7824,18 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             prompt_base = round_system_prompt or current_system_prompt()
             if cad_job.phase == cad_workflow.CadPhase.PLAN_REQUIRED:
                 prompt_base = _cad_plan_system_prompt(prompt_base)
+            # Upstream text-to-cad is a progressive-disclosure skill: a
+            # reference is loaded when its trigger fires, not the whole set on
+            # every round. Re-injecting SKILL.md (or worse, the 24KB
+            # references/build123d-modeling.md) each round costs thousands of
+            # prompt tokens per turn across a CAD run that legitimately spans
+            # dozens of turns. Inject only the contract the current phase cannot
+            # proceed without; the phase instruction names any further reference
+            # for the model to pull on demand with view_skill.
             skill_text = ""
-            if cad_job.phase != cad_workflow.CadPhase.PLAN_REQUIRED:
+            for resource in cad_job.resources():
                 try:
-                    skill_text = read_skill_resource("cad", "SKILL.md")
+                    skill_text += read_skill_resource("cad", resource)
                 except (OSError, UnicodeError, ValueError):
                     pass
             runtime_contract = (
@@ -7740,7 +7846,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 prompt_base
                 + runtime_contract
                 + "\n\n" + cad_job.instruction(
-                    include_skill=bool(skill_text), skill_text=skill_text)
+                    skill_text=skill_text,
+                    cad_python=str(cad.cad_runtime_python()),
+                    scripts_dir=str(_cad_skill_scripts_dir()).replace("\\", "/"))
             )
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
@@ -7770,7 +7878,12 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         )
         if cad_job is not None:
             turn_max_tokens = cad_job.max_completion_tokens(
-                turn_max_tokens, CAD_PLAN_MAX_COMPLETION_TOKENS)
+                turn_max_tokens,
+                plan_limit=CAD_PLAN_MAX_COMPLETION_TOKENS,
+                source_limit=CAD_SOURCE_MAX_COMPLETION_TOKENS,
+                action_limit=CAD_ACTION_MAX_COMPLETION_TOKENS,
+                final_limit=CAD_FINAL_MAX_COMPLETION_TOKENS,
+            )
         try:
             with spin("thinking..."):
                 response = _create_completion_with_fallback(
@@ -7778,6 +7891,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     system_prompt=round_system_prompt, on_token=on_token,
                     interrupt_check=interrupt_check, trace=trace, turn=turn,
                     max_tokens=turn_max_tokens,
+                    reasoning_effort=(
+                        CAD_REASONING_EFFORT if cad_job is not None
+                        and cad_job.phase != cad_workflow.CadPhase.COMPLETE else ""
+                    ),
                     client_override=loop_client,
                     provider_override=loop_provider,
                     model_override=loop_model,
@@ -7816,15 +7933,27 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 # The truncated content cannot be executed and may be huge.
                 # Drop it so the retry starts from a smaller request.
                 messages.pop()
-                cad_decomposition_required = True
-                retry_instruction = (
-                    f"{warning} Abandon that generator. Write a substantially smaller, "
-                    "simpler gen_step() source (helpers/loops instead of one long "
-                    "unrolled program) with write_file, then run it via "
-                    f'"{cad.cad_runtime_python()}" "{_cad_skill_scripts_dir()}/gen" '
-                    "<target.py> --write --json. Split a complex assembly into separate "
-                    "component source files if needed."
-                )
+                if cad_job.phase == cad_workflow.CadPhase.SOURCE_REQUIRED:
+                    cad_decomposition_required = True
+                    retry_instruction = (
+                        f"{warning} Abandon that generator and write a substantially "
+                        "smaller one. Compute repeated geometry at runtime with "
+                        "parameters, helpers, recursion and loops instead of unrolling "
+                        "coordinates, and do not work the geometry out in your head -- "
+                        "that is the generator's job at runtime. Split a complex "
+                        "assembly into separate component source files if needed. Make "
+                        "one complete write_file call."
+                    )
+                else:
+                    # Nothing to rewrite in the command-only phases: repeat the
+                    # phase's own single call rather than re-authoring source.
+                    retry_instruction = (
+                        f"{warning} Stop reasoning and perform the current bounded CAD "
+                        "phase immediately with one complete tool call.\n\n"
+                        + cad_job.instruction(
+                            cad_python=str(cad.cad_runtime_python()),
+                            scripts_dir=str(_cad_skill_scripts_dir()).replace("\\", "/"))
+                    )
             elif content:
                 # A genuinely large answer/tool call was in progress.
                 retry_instruction = (
@@ -7845,7 +7974,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 on_result("error", warning)
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
-            if length_retries < 1:
+            if length_retries < length_retry_budget:
                 length_retries += 1
                 messages.append({"role": "user", "content": retry_instruction})
                 continue
