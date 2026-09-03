@@ -170,7 +170,7 @@ Add `api_max_retries` and the three tuning keys to the commented config template
   remaining retries, `_extract_retry_after` seconds parsing, and
   `_retry_delay` cap/backoff math. All pass; full existing suite unaffected
   (verified modulo pre-existing, unrelated collection errors in
-  `tests/test_cad.py` and friends caused by direct `from agent8088 import`
+  tests caused by direct `from agent8088 import`
   outside the conftest sys.path fixture — not touched by this change).
 
 ## Usage after the change
