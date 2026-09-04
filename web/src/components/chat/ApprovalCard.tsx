@@ -117,20 +117,17 @@ export function ApprovalCard() {
   const [animate, setAnimate] = useState(false)
   const [ready, setReady] = useState(false)
 
-  // Build the "questions" from the actual escalation data
+  // One screen: what is being asked, and the answer. This used to be two
+  // carousel steps, which put the only actual choices behind a "Continue"
+  // that read as the confirmation itself.
   const steps = approvalPending
     ? [
-        // Step 1: Description — what the tool wants to do
-        {
-          kind: 'info' as const,
-          q: `Tool: ${approvalPending.toolName}`,
-          detail: approvalPending.description,
-        },
-        // Step 2: Decision — approve once / approve for session / deny
         {
           kind: 'choice' as const,
-          q: 'Allow this action?',
+          q: `Allow ${approvalPending.toolName}?`,
           type: 'radio' as const,
+          paths: approvalPending.paths ?? [],
+          detail: approvalPending.reason || approvalPending.description,
           options: [
             { label: 'Approve once', icon: 'check-once' as const },
             { label: 'Approve for session', icon: 'check-session' as const },
@@ -310,23 +307,31 @@ export function ApprovalCard() {
                       aria-hidden={active ? undefined : true}
                       style={stepStyle}
                     >
-                      {step.kind === 'info' ? (
+                      {(
                         <div>
                           <div className="pr-7 text-[14px] font-medium text-zinc-900 dark:text-zinc-100">
                             {step.q}
                           </div>
-                          <div className="mt-1 text-[12px] font-mono text-brand-primary">
+                          <div className="mt-1 font-mono text-[12px] text-brand-primary">
                             {approvalPending.changeType}
                           </div>
-                          <pre className="mt-2 max-h-28 overflow-auto rounded-lg bg-zinc-100 dark:bg-zinc-950 p-2 font-mono text-[11px] text-zinc-600 dark:text-zinc-400 whitespace-pre-wrap break-all">
-                            {step.detail}
-                          </pre>
-                        </div>
-                      ) : (
-                        <div>
-                          <div className="pr-7 text-[14px] font-medium text-zinc-900 dark:text-zinc-100">
-                            {step.q}
-                          </div>
+                          {step.paths.length > 0 && (
+                            <ul className="mt-2 flex flex-col gap-0.5 rounded-lg bg-zinc-100 p-2 dark:bg-zinc-950">
+                              {step.paths.map((path) => (
+                                <li
+                                  key={path}
+                                  className="break-all font-mono text-[11px] text-zinc-700 dark:text-zinc-300"
+                                >
+                                  {path}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                          {step.detail && (
+                            <p className="mt-2 max-h-24 overflow-auto text-[11.5px] leading-relaxed text-zinc-600 dark:text-zinc-400">
+                              {step.detail}
+                            </p>
+                          )}
                           <GlideMenu
                             className="mt-2.5 flex flex-col gap-1"
                             highlightClassName="bg-zinc-100 dark:bg-zinc-800/50"

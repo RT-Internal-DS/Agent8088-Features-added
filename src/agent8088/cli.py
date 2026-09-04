@@ -1544,6 +1544,53 @@ def _drain_queued_keys():
             pass
 
 
+# Set while a cmd_* handler runs on behalf of a front end that is not this
+# process's terminal — today, the web bridge. See _can_prompt.
+_PROMPTS_DISABLED = False
+
+
+def _can_prompt() -> bool:
+    """Whether there is a human at *this process's* terminal to ask.
+
+    sys.stdin.isatty() on its own answers a different question. `agent8088
+    --web` started from a shell has a tty on stdin, but that terminal belongs
+    to the operator, not to the browser that sent the command — and
+    _handle_command has swapped the console for a StringIO buffer, so a prompt
+    written there is never seen either. Reading stdin then blocks the web
+    request forever on input the browser cannot supply, and leaks the worker
+    thread it was running on. The front end says so explicitly rather than
+    leaving every helper to guess from the file descriptor.
+    """
+    return not _PROMPTS_DISABLED and sys.stdin.isatty()
+
+
+def _stdin_answerable() -> bool:
+    """Whether *something* can supply a line on stdin — a tty or a pipe.
+
+    Distinct from _can_prompt: agent8088 is legitimately driven with chat
+    turns and o/s/d approvals piped in, where stdin is not a tty but a read
+    still returns the answer. Only a front end with no stdin to offer at all
+    (the web bridge) makes a read unanswerable, and it says so.
+    """
+    return not _PROMPTS_DISABLED
+
+
+@contextmanager
+def no_terminal_prompts():
+    """Run a block with terminal prompting off; helpers degrade instead of read.
+
+    Nests safely: the previous state is restored rather than assumed False, so
+    an inner use cannot re-enable prompting for the block around it.
+    """
+    global _PROMPTS_DISABLED
+    previous = _PROMPTS_DISABLED
+    _PROMPTS_DISABLED = True
+    try:
+        yield
+    finally:
+        _PROMPTS_DISABLED = previous
+
+
 def _permission_choice(question, options, typed_prompt, typed_map, default):
     """Ask the user to pick one of `options` — a list of (value, label).
 
@@ -1554,8 +1601,12 @@ def _permission_choice(question, options, typed_prompt, typed_map, default):
     An arrow-key picker on an interactive tty, falling back to the original
     typed prompt when InquirerPy is missing or stdin is not a terminal. The
     fallback keeps the old contract exactly, `default` included, so piped runs
-    and the test suite are unaffected.
+    and the test suite are unaffected. With no terminal to prompt at all, the
+    default is taken without reading — the same answer the fallback would
+    reach on EOF, minus the blocking read.
     """
+    if not _stdin_answerable():
+        return default
     if sys.stdin.isatty():
         try:
             from InquirerPy import inquirer
@@ -2076,7 +2127,7 @@ def _confirm_destructive(what: str, detail: str = "") -> bool:
     Returns True to proceed. Non-interactive sessions proceed without asking —
     there is nobody to ask, and blocking would break scripted use.
     """
-    if not A.DESTRUCTIVE_CONFIRM or not sys.stdin.isatty():
+    if not A.DESTRUCTIVE_CONFIRM or not _can_prompt():
         return True
     suffix = f" {detail}" if detail else ""
     answer = console.input(
@@ -2353,7 +2404,7 @@ def select_agent(profiles):
     """Interactive arrow-key picker over sub-agent profiles.
     Returns the chosen name, or None on cancel / non-interactive stdin."""
     names = sorted(profiles)
-    if not names or termios is None or not sys.stdin.isatty():
+    if not names or termios is None or not _can_prompt():
         return None
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
@@ -2405,6 +2456,10 @@ def cmd_agent(rest):
             console.print("[dim]cancelled — try /agent <name> <task>, or /agents to list them[/dim]")
             return
     if not task:
+        if not _stdin_answerable():
+            console.print("[dim]cancelled — /agent needs the task on the same line "
+                          "here: /agent <name> <task>[/dim]")
+            return
         try:
             task = console.input(f"[#237dd7]task for [bold]{name}[/bold] ›[/#237dd7] ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -4450,6 +4505,11 @@ def _custom_prompt(message, default="", secret=False, instruction=""):
 
 
 def _choice_prompt(message, choices, default=""):
+    # Nobody can answer: the numbered fallback below ends in a blocking
+    # input(), so take the default rather than stall the caller. A piped run
+    # still falls through and reads its answer.
+    if not _stdin_answerable():
+        return default or (choices[0] if choices else "")
     try:
         from InquirerPy import inquirer
         # InquirerPy's fuzzy prompt mis-renders (duplicate/garbled highlighted

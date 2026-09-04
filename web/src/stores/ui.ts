@@ -14,6 +14,8 @@ interface UIState {
     toolName: string
     changeType: string
     description: string
+    reason: string
+    paths: string[]
   } | null
   planApprovalPending: {
     id: string

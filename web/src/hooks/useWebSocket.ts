@@ -67,6 +67,8 @@ function wireSocket(ws: WebSocket) {
           toolName: data.tool_name,
           changeType: data.change_type,
           description: data.description,
+          reason: data.reason ?? data.description,
+          paths: data.paths ?? [],
         })
         break
       case 'plan_approval':

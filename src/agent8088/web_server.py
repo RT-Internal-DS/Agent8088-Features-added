@@ -250,7 +250,7 @@ async def get_commands():
 
 @app.get("/api/tools")
 async def get_tools():
-    """Full tool registry: all 32 tools with args, mode, description."""
+    """Full tool registry: every tool with args, mode, description."""
     A = _eng()
     tools = []
     for name, spec in sorted(A.TOOL_SPECS.items()):
@@ -1505,18 +1505,36 @@ manager = _ConnectionManager()
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    """Bidirectional WebSocket for streaming agent turns, tool events, approvals."""
+    """Bidirectional WebSocket for streaming agent turns, tool events, approvals.
+
+    A turn runs as its own task rather than being awaited here, because the
+    frames that steer a turn — approval, plan_approval, interrupt — are the
+    ones the client sends *while* it is running. Awaiting the turn inline meant
+    none of them was read until it was over: the escalation card's Approve
+    button waited out its own 300s timeout and was then denied, Stop did
+    nothing, and the unread frames stalled uvicorn's WebSocket reader until its
+    keepalive closed the socket with 1011. One turn at a time, so a second
+    prompt cannot interleave with the first on shared session state.
+    """
     await manager.connect(ws)
     A, C = _eng(), _cl()
+    turn: "asyncio.Task | None" = None
     try:
         while True:
             msg = await ws.receive_json()
             msg_type = msg.get("type")
 
-            if msg_type == "chat":
-                await _handle_chat(ws, msg, A, C)
-            elif msg_type == "command":
-                await _handle_command(ws, msg, A, C)
+            if msg_type in ("chat", "command"):
+                if turn is not None and not turn.done():
+                    await ws.send_json({
+                        "type": "error",
+                        "message": "still working on the previous message — "
+                                   "stop it first, or wait for it to finish.",
+                    })
+                    continue
+                handler = _handle_chat if msg_type == "chat" else _handle_command
+                turn = asyncio.create_task(handler(ws, msg, A, C))
+                turn.add_done_callback(_log_turn_failure)
             elif msg_type == "interrupt":
                 # Signal the EscListener — but since we run in async, we
                 # use a threading.Event shared with the agent thread.
@@ -1541,6 +1559,32 @@ async def websocket_endpoint(ws: WebSocket):
         log.error("WebSocket error: %s", exc)
         manager.disconnect(ws)
         _fail_pending_waits()
+    finally:
+        # _fail_pending_waits has already released every escalation this turn
+        # could be blocked on, so it can reach its own cleanup -- give it a
+        # bounded moment to, rather than leaving a pending task behind.
+        # shield() so a timeout cancels the wait, not the turn itself.
+        if turn is not None and not turn.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(turn), timeout=10)
+            except asyncio.CancelledError:
+                turn.cancel()
+                raise            # never swallow our own cancellation
+            except Exception:
+                turn.cancel()
+
+
+def _log_turn_failure(task: "asyncio.Task"):
+    """Surface a crashed turn task, which would otherwise fail silently.
+
+    _handle_chat and _handle_command both report their own errors to the
+    client; this only catches what escapes them.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error("turn task failed: %s", exc)
 
 
 # --- Shared state for interrupt + approval flows (engine runs in a thread) ---
@@ -1562,6 +1606,52 @@ def _fail_pending_waits():
         entry["mode"] = ""
         entry["event"].set()
     _pending_plan_approvals.clear()
+
+
+_ESCALATION_PREFIX = "ESCALATION_REQUEST\x1f"
+
+
+def _parse_escalation(result: str):
+    """Split engine.request_escalation's wire record into named fields.
+
+    The record is `\\x1f`-delimited rather than ':'-delimited so a Windows
+    drive letter cannot break the parse — hence split(..., 4), which also
+    keeps a reason containing a separator whole. Returns None for anything
+    that is not a complete record, so callers fall back to the raw text
+    instead of rendering half a card.
+    """
+    text = str(result or "")
+    if not text.startswith(_ESCALATION_PREFIX):
+        return None
+    parts = text.split("\x1f", 4)
+    if len(parts) < 5:
+        return None
+    _, target_mode, change_type, paths, reason = parts
+    return {
+        "target_mode": target_mode,
+        "change_type": change_type,
+        "paths": [p for p in paths.split(",") if p],
+        "reason": reason,
+    }
+
+
+def _escalation_event(tool_name: str, result: str, esc_id: str) -> dict:
+    """The approval card's payload: named fields, never the raw record.
+
+    `description` stays in the payload as the one-line summary a client can
+    show without knowing the field names.
+    """
+    detail = _parse_escalation(result)
+    if detail is None:
+        return {"type": "escalation", "tool_name": tool_name, "id": esc_id,
+                "change_type": "write", "target_mode": "", "paths": [],
+                "reason": "", "description": scrub_markup(result)[:1000]}
+    return {"type": "escalation", "tool_name": tool_name, "id": esc_id,
+            "change_type": detail["change_type"],
+            "target_mode": detail["target_mode"],
+            "paths": detail["paths"],
+            "reason": detail["reason"],
+            "description": scrub_markup(detail["reason"])[:1000]}
 
 
 async def _handle_chat(ws: WebSocket, msg: dict, A, C):
@@ -1655,10 +1745,7 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
         entry = {"event": threading.Event(), "approved": False, "session_scope": False}
         _pending_approvals[esc_id] = entry
         asyncio.run_coroutine_threadsafe(
-            ws.send_json({"type": "escalation", "tool_name": name,
-                          "change_type": "write",
-                          "description": scrub_markup(result)[:1000],
-                          "id": esc_id}),
+            ws.send_json(_escalation_event(name, result, esc_id)),
             loop,
         )
         entry["event"].wait(timeout=300)
@@ -1821,7 +1908,13 @@ async def _handle_command(ws: WebSocket, msg: dict, A, C):
             original_console = C.console
             C.console = temp_console
             try:
-                handler(args)
+                # The browser cannot answer a terminal prompt, and this console
+                # is a StringIO nobody is watching, so a console.input() here
+                # would block on the server's own stdin until the request died.
+                # Handlers that would have asked degrade instead — /reset and
+                # /memory clear proceed, /agent reports what it needs.
+                with C.no_terminal_prompts():
+                    handler(args)
             finally:
                 C.console = original_console
             return buf.getvalue()

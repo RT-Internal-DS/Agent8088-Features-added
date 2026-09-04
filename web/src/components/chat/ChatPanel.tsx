@@ -1,4 +1,5 @@
 import { useRef, useEffect, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { useSessionStore } from '@/stores/session'
 import { useUIStore } from '@/stores/ui'
 import { MessageBubble } from './MessageBubble'
@@ -8,8 +9,28 @@ import { ApprovalCard } from './ApprovalCard'
 import { PromptBar } from './PromptBar'
 import { RawPanel } from './RawPanel'
 import { scrubMarkup } from '@/lib/scrub'
+import type { ToolSpec } from '@/types/api'
+
+/** Tool and mode counts, read from the live registry.
+ *  These were hardcoded ("32 tools across 14 modes") and went stale the next
+ *  time a tool was added. */
+function useToolCounts() {
+  const { data } = useQuery({
+    queryKey: ['tools'],
+    queryFn: async () => {
+      const response = await fetch('/api/tools')
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      return response.json() as Promise<ToolSpec[]>
+    },
+    staleTime: Infinity,
+  })
+  if (!data?.length) return null
+  const modes = new Set(data.map((tool) => tool.mode).filter(Boolean))
+  return { tools: data.length, modes: modes.size }
+}
 
 export function ChatPanel() {
+  const counts = useToolCounts()
   const { messages, toolEvents, isStreaming, streamingText } = useSessionStore()
   const { theme, rawPanelOpen } = useUIStore()
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -49,7 +70,10 @@ export function ChatPanel() {
               <SuggestionCard title="Ask anything" subtitle="Research, write code, analyze" />
               <SuggestionCard title="Run a command" subtitle="Type / for all commands" />
               <SuggestionCard title="Plan a task" subtitle="Use /plan to propose & execute" />
-              <SuggestionCard title="Browse tools" subtitle="32 tools across 14 modes" />
+              <SuggestionCard
+                title="Browse tools"
+                subtitle={counts ? `${counts.tools} tools across ${counts.modes} modes` : 'Every tool the agent can call'}
+              />
             </div>
 
             <div className="mt-5 flex items-center gap-1.5 text-[11px] text-zinc-400 dark:text-zinc-600">

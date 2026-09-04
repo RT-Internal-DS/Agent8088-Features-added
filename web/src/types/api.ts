@@ -263,7 +263,7 @@ export type WSEvent =
   | { type: 'tool_result'; name: string; result: string }
   | { type: 'tool_calls'; calls: Array<{ name: string; args: Record<string, unknown> }> }
   | { type: 'spin'; message: string; elapsed: number; tokens: number }
-  | { type: 'escalation'; tool_name: string; change_type: string; description: string; id: string }
+  | { type: 'escalation'; tool_name: string; change_type: string; description: string; id: string; reason?: string; paths?: string[]; target_mode?: string }
   | { type: 'plan_approval'; plan: string; id: string }
   | { type: 'plan_step'; index: number; total: number; step_text: string; tool_name: string; status: 'pending' | 'running' | 'done' | 'failed'; result?: string }
   | { type: 'answer'; text: string; usage: { seconds: number; tokens: number; context?: number } }
